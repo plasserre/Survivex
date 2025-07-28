@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "survivex"
 version = "0.1.0"
-description = "Advanced survivexal analysis library for Python with GPU acceleration and comprehensive statistical methods"
+description = "Advanced survival analysis library for Python with GPU acceleration and comprehensive statistical methods"
 authors = [
     {name = "Surviv Contributors", email = "maintainers@survivex.org"}
 ]
@@ -16,7 +16,7 @@ license = {text = "Apache-2.0"}
 readme = "README.md"
 requires-python = ">=3.8"
 keywords = [
-    "survivexal analysis",
+    "survival analysis",
     "statistics", 
     "biostatistics",
     "machine learning",
@@ -79,7 +79,7 @@ viz = [
 ]
 benchmark = [
     "lifelines>=0.27.0",
-    "scikit-survivexal>=0.20.0",
+    "scikit-survival>=0.20.0",
     "memory-profiler>=0.60.0",
 ]
 all = ["survivex[dev,gpu,viz,benchmark]"]

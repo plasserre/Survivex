@@ -4,14 +4,14 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "surviv"
+name = "survivex"
 version = "0.1.0"
 description = "Advanced survival analysis library for Python with GPU acceleration and comprehensive statistical methods"
 authors = [
-    {name = "Surviv Contributors", email = "maintainers@surviv.org"}
+    {name = "Surviv Contributors", email = "maintainers@survivex.org"}
 ]
 maintainers = [
-    {name = "Surviv Core Team", email = "core@surviv.org"}
+    {name = "Surviv Core Team", email = "core@survivex.org"}
 ]
 license = {text = "Apache-2.0"}
 readme = "README.md"
@@ -86,12 +86,12 @@ benchmark = [
 all = ["surviv[dev,gpu,viz,benchmark]"]
 
 [project.urls]
-Homepage = "https://github.com/surviv-py/surviv"
-Documentation = "https://surviv.readthedocs.io"
-Repository = "https://github.com/surviv-py/surviv"
-"Bug Tracker" = "https://github.com/surviv-py/surviv/issues"
-"Discussions" = "https://github.com/surviv-py/surviv/discussions"
-Changelog = "https://github.com/surviv-py/surviv/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/survivex-py/survivex"
+Documentation = "https://survivex.readthedocs.io"
+Repository = "https://github.com/survivex-py/survivex"
+"Bug Tracker" = "https://github.com/survivex-py/surviv/issues"
+"Discussions" = "https://github.com/survivex-py/surviv/discussions"
+Changelog = "https://github.com/survivex-py/surviv/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -144,7 +144,7 @@ minversion = "7.0"
 testpaths = ["tests"]
 addopts = [
     "-v",
-    "--cov=surviv",
+    "--cov=survivex",
     "--cov-report=term-missing",
     "--cov-report=html:htmlcov",
     "--cov-report=xml:coverage.xml",
@@ -165,7 +165,7 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["surviv"]
+source = ["survivex"]
 omit = [
     "*/tests/*",
     "*/test_*.py",

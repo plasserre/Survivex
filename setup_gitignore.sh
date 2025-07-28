@@ -104,7 +104,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-surviv-env/
+survivex-env/
 
 # Spyder project settings
 .spyderproject
