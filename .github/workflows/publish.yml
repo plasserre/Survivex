@@ -24,7 +24,7 @@ jobs:
         
     - name: Run tests
       run: |
-        pytest tests/ -v --cov=surviv
+        pytest tests/ -v --cov=survivex
         
   publish:
     needs: test

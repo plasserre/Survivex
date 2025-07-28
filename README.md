@@ -1,2 +1,2 @@
-# surviveX
-creating survival analysis models in python
+# survivexeX
+creating survivexal analysis models in python

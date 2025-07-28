@@ -50,7 +50,7 @@ repos:
     rev: 1.7.5
     hooks:
       - id: bandit
-        args: [-r, surviv/, -f, json, -o, bandit-report.json]
+        args: [-r, survivex/, -f, json, -o, bandit-report.json]
         pass_filenames: false
 
   # Docstring formatting
