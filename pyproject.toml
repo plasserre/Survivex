@@ -5,18 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "survivex"
 version = "0.1.0"
-description = "Advanced survival analysis library for Python with GPU acceleration and comprehensive statistical methods"
+description = "Advanced survivexal analysis library for Python with GPU acceleration and comprehensive statistical methods"
 authors = [
-    {name = "Surviv Contributors", email = "maintainers@survivex.org"}
+    {name = "survivex Contributors", email = "maintainers@survivex.org"}
 ]
 maintainers = [
-    {name = "Surviv Core Team", email = "core@survivex.org"}
+    {name = "survivex Core Team", email = "core@survivex.org"}
 ]
 license = {text = "Apache-2.0"}
 readme = "README.md"
 requires-python = ">=3.8"
 keywords = [
-    "survival analysis",
+    "survivexal analysis",
     "statistics", 
     "biostatistics",
     "machine learning",

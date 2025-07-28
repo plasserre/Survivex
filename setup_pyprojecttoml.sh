@@ -8,10 +8,10 @@ name = "survivex"
 version = "0.1.0"
 description = "Advanced survival analysis library for Python with GPU acceleration and comprehensive statistical methods"
 authors = [
-    {name = "Surviv Contributors", email = "maintainers@survivex.org"}
+    {name = "Survivex Contributors", email = "maintainers@survivex.org"}
 ]
 maintainers = [
-    {name = "Surviv Core Team", email = "core@survivex.org"}
+    {name = "survivex Core Team", email = "core@survivex.org"}
 ]
 license = {text = "Apache-2.0"}
 readme = "README.md"
@@ -83,23 +83,23 @@ benchmark = [
     "scikit-survival>=0.20.0",
     "memory-profiler>=0.60.0",
 ]
-all = ["surviv[dev,gpu,viz,benchmark]"]
+all = ["survivex[dev,gpu,viz,benchmark]"]
 
 [project.urls]
 Homepage = "https://github.com/survivex-py/survivex"
 Documentation = "https://survivex.readthedocs.io"
 Repository = "https://github.com/survivex-py/survivex"
-"Bug Tracker" = "https://github.com/survivex-py/surviv/issues"
-"Discussions" = "https://github.com/survivex-py/surviv/discussions"
-Changelog = "https://github.com/survivex-py/surviv/blob/main/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/survivex-py/survivex/issues"
+"Discussions" = "https://github.com/survivex-py/survivex/discussions"
+Changelog = "https://github.com/survivex-py/survivex/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["surviv*"]
+include = ["survivex*"]
 exclude = ["tests*", "docs*", "examples*"]
 
 [tool.setuptools.package-data]
-surviv = ["datasets/data/*", "py.typed"]
+survivex = ["datasets/data/*", "py.typed"]
 
 [tool.black]
 line-length = 100

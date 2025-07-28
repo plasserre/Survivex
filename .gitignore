@@ -139,7 +139,7 @@ dmypy.json
 ehthumbs.db
 Thumbs.db
 
-# Surviv specific
+# Survivex specific
 *.pkl
 *.joblib
 experiments/
