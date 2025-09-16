@@ -119,48 +119,63 @@ class SurvivalData:
 
 
 
+    # survivex/core/data.py - Update the from_pandas method
+
     @classmethod
-    def from_pandas(cls, df: pd.DataFrame, 
-                   time_col: str = 'time',
-                   event_col: str = 'event',
-                   feature_cols: Optional[List[str]] = None) -> 'SurvivalData':
+    def from_pandas(cls, 
+                df: pd.DataFrame,
+                time_col: str = 'time',
+                event_col: str = 'event',
+                feature_cols: Optional[List[str]] = None) -> 'SurvivalData':
         """
-        Create from pandas DataFrame
+        Create SurvivalData from pandas DataFrame
         
         Parameters
         ----------
         df : pd.DataFrame
-            Input DataFrame
+            Input dataframe
         time_col : str
-            Column name for survival times
-        event_col : str  
-            Column name for event indicators
+            Name of time column
+        event_col : str
+            Name of event column
         feature_cols : list, optional
-            Column names for features/covariates
+            Names of feature columns
             
         Returns
         -------
-        SurvivalData
-            Created survival data object
-            
-        Examples
-        --------
-        >>> df = pd.DataFrame({
-        ...     'time': [1, 3, 5, 7],
-        ...     'event': [1, 1, 0, 1], 
-        ...     'age': [65, 70, 55, 60],
-        ...     'sex': [1, 0, 1, 0]
-        ... })
-        >>> data = SurvivalData.from_pandas(df, feature_cols=['age', 'sex'])
-        >>> print(data)
+        SurvivalData object
         """
+        # Extract time and event
         time = df[time_col].values
         event = df[event_col].values
         
-        X = None
-        feature_names = None
+        # Extract features
         if feature_cols:
-            X = df[feature_cols].values
-            feature_names = feature_cols
+            # Filter to only numeric features
+            numeric_features = []
+            for col in feature_cols:
+                if col in df.columns:
+                    if pd.api.types.is_numeric_dtype(df[col]):
+                        numeric_features.append(col)
+                    else:
+                        print(f"⚠️ Skipping non-numeric feature '{col}' - encode it first")
             
+            if numeric_features:
+                X = df[numeric_features].values
+                feature_names = numeric_features
+            else:
+                X = None
+                feature_names = None
+        else:
+            # Auto-detect numeric features
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            feature_cols = [col for col in numeric_cols if col not in [time_col, event_col]]
+            
+            if feature_cols:
+                X = df[feature_cols].values
+                feature_names = feature_cols
+            else:
+                X = None
+                feature_names = None
+        
         return cls(time=time, event=event, X=X, feature_names=feature_names)
