@@ -116,11 +116,6 @@ class SurvivalData:
         return df
     
 
-
-
-
-    # survivex/core/data.py - Update the from_pandas method
-
     @classmethod
     def from_pandas(cls, 
                 df: pd.DataFrame,

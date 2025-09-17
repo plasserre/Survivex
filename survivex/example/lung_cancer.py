@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import torch
 from survivex.datasets.loaders import load_survival_dataset
 from survivex.datasets.validators import validate_survival_data
 from survivex.datasets.converters import auto_detect_format, load_from_lifelines
@@ -204,6 +205,8 @@ def test_lung_cancer():
     #you can also pass the feature columns to the loader
 
 
+
+
 if __name__ == "__main__":
-    # test_lung_cancer()
+    test_lung_cancer()
     test_lung_cancer_variations()
