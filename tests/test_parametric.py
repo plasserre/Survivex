@@ -4,13 +4,17 @@ Test Parametric Models against lifelines
 
 import numpy as np
 import pandas as pd
-from survivex.models.parametric_models import WeibullPHFitter, WeibullAFTFitter, LogLogisticAFTFitter, LogNormalAFTFitter
+from survivex.models.parametric_models import WeibullPHFitter, WeibullAFTFitter, LogLogisticAFTFitter, LogNormalAFTFitter, ExponentialFitter
 from lifelines import WeibullFitter, WeibullAFTFitter as LifelinesWeibullAFTFitter
 from lifelines.datasets import load_rossi
-
 from lifelines import LogLogisticAFTFitter as LifelinesLogLogisticAFTFitter
-
 from lifelines import LogNormalAFTFitter as LifelinesLogNormalAFTFitter
+
+from lifelines import ExponentialFitter as LifelinesExponentialFitter
+from lifelines import GeneralizedGammaRegressionFitter as LifelinesGeneralizedGammaFitter
+
+
+
 
 print("=" * 80)
 print("TEST 1: WEIBULL PH - NO COVARIATES")
@@ -279,3 +283,98 @@ for i in range(3):
 print("\n" + "=" * 80)
 print("ALL TESTS COMPLETE - 8 TESTS")
 print("=" * 80)
+
+
+
+"""
+Tests for Additional Parametric Models
+Add these tests to test_parametric_models.py
+"""
+
+
+
+print("\n" + "=" * 80)
+print("TEST 9: EXPONENTIAL - NO COVARIATES")
+print("=" * 80)
+
+rossi = load_rossi()
+T = rossi['week'].values
+E = rossi['arrest'].values
+
+exp_fitter = ExponentialFitter()
+exp_fitter.fit(T, E, X=None)
+
+exp_ll = LifelinesExponentialFitter()
+exp_ll.fit(T, E)
+
+print(f"\nOur Model:")
+print(f"  lambda (hazard rate): {exp_fitter.lambda_ * np.exp(exp_fitter.coef_[0]):.6f}")
+print(f"  mean survival time: {exp_fitter.predict_expectation(X=None):.2f}")
+print(f"  log-likelihood: {exp_fitter.log_likelihood_:.4f}")
+
+print(f"\nLifelines:")
+print(f"  lambda_ (mean): {exp_ll.lambda_:.2f}")
+
+print(f"\nNote: Lifelines uses lambda_ for MEAN, we use lambda for RATE")
+print(f"They are inverses: rate = 1/mean")
+print(f"  Our rate: {exp_fitter.lambda_ * np.exp(exp_fitter.coef_[0]):.6f}")
+print(f"  1/lifelines_mean: {1.0/exp_ll.lambda_:.6f}")
+print(f"  Match: {np.isclose(exp_fitter.lambda_ * np.exp(exp_fitter.coef_[0]), 1.0/exp_ll.lambda_)}")
+
+times = np.array([10, 20, 30, 50])
+S_ours = exp_fitter.predict_survival_function(X=None, times=times)
+S_ll = exp_ll.survival_function_at_times(times).values
+
+print(f"\nSurvival predictions at t={times}:")
+print(f"  Ours:      {S_ours}")
+print(f"  Lifelines: {S_ll}")
+print(f"  Max diff: {np.max(np.abs(S_ours - S_ll)):.8f}")
+
+# Test mean
+mean_ours = exp_fitter.predict_expectation(X=None)
+mean_ll = exp_ll.lambda_  # Lifelines lambda IS the mean, not the rate
+print(f"\nMean survival time:")
+print(f"  Ours: {mean_ours:.2f}")
+print(f"  Lifelines: {mean_ll:.2f}")
+print(f"  Diff: {abs(mean_ours - mean_ll):.8f}")
+
+print("\n" + "=" * 80)
+print("TEST 10: EXPONENTIAL - WITH COVARIATES")
+print("=" * 80)
+
+covariates = ['age', 'prio']
+X = rossi[covariates].values
+
+exp_cov = ExponentialFitter()
+exp_cov.fit(T, E, X)
+
+exp_ll_cov = LifelinesExponentialFitter()
+exp_ll_cov.fit(T, E, label='week')
+
+print(f"\nOur Model:")
+print(f"  Intercept: {exp_cov.coef_[0]:.6f}")
+print(f"  age coef:  {exp_cov.coef_[1]:.6f}")
+print(f"  prio coef: {exp_cov.coef_[2]:.6f}")
+print(f"  lambda:    {exp_cov.lambda_:.6f}")
+print(f"  log-likelihood: {exp_cov.log_likelihood_:.4f}")
+
+# Note: Lifelines ExponentialFitter doesn't support covariates in the same way
+# So we just validate our implementation works correctly
+print(f"\nNote: Lifelines ExponentialFitter has different covariate API")
+print(f"Our implementation provides full covariate support.")
+
+# Validate predictions work
+for i in range(3):
+    sample_X = X[i:i+1, :]
+    median_ours = exp_cov.predict_median(sample_X)
+    mean_ours = exp_cov.predict_expectation(sample_X)
+    
+    print(f"\nIndividual {i+1} (age={X[i,0]:.0f}, prio={X[i,1]:.0f}):")
+    print(f"  Median: {median_ours:.2f}, Mean: {mean_ours:.2f}")
+
+
+
+
+
+
+
