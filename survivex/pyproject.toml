@@ -53,4 +53,4 @@ Repository = "https://github.com/TaninZeraati/survivex"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["survivex*"]
-exclude = ["tests*"]
+exclude = ["tests*", "docs*", "examples*"]
