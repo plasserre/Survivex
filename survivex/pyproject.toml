@@ -50,7 +50,9 @@ dev = [
 Homepage = "https://github.com/TaninZeraati/survivex"
 Repository = "https://github.com/TaninZeraati/survivex"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["survivex*"]
-exclude = ["tests*", "docs*", "examples*"]
+[tool.setuptools]
+# Explicitly include all packages
+packages = ["survivex", "survivex.models", "survivex.core", "survivex.datasets", "survivex.utils", "survivex.visualization"]
+
+[tool.setuptools.package-data]
+survivex = ["**/*.py"]
