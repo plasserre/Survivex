@@ -10,7 +10,7 @@ __version__ = "0.1.0"
 __author__ = "Tanin Zeraati"
 import os
 import sys
-project_root = os.path.dirname('survivex/core')
+project_root = os.path.dirname('/Users/taninzeraati/GitHub/survivex/survivex/models')
 sys.path.insert(0, project_root)
 
 # Import main classes
