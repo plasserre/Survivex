@@ -2,25 +2,19 @@
 SurviveX: GPU-Accelerated Survival Analysis Library
 
 A comprehensive survival analysis library with PyTorch backend for GPU acceleration.
-Developed as part of research on regulatory application lifecycle prediction using
-hybrid process mining and survival analysis frameworks.
 """
 
 __version__ = "0.1.0"
 __author__ = "Tanin Zeraati"
-import os
-import sys
-project_root = os.path.dirname('/Users/taninzeraati/GitHub/survivex/survivex/models')
-sys.path.insert(0, project_root)
 
-# Import main classes
-from .kaplan_meier import KaplanMeier
-from .nelson_aalen import NelsonAalen
-from .log_rank_test import LogRankTest
-from .cox_ph import CoxPH
-from .competing_risk import AalenJohansen, FineGray, GraysTest
-from .multi_state import MultiState
-from .parametric_models import (
+# Import main classes from models subdirectory
+from survivex.models.kaplan_meier import KaplanMeier
+from survivex.models.nelson_aalen import NelsonAalen
+from survivex.models.log_rank_test import LogRankTest
+from survivex.models.cox_ph import CoxPH
+from survivex.models.competing_risk import AalenJohansen, FineGray, GraysTest
+from survivex.models.multi_state import MultiState
+from survivex.models.parametric_models import (
     WeibullModel, 
     ExponentialModel, 
     LogNormalModel, 
