@@ -39,6 +39,10 @@ from .parametric_models import (
     ExponentialFitter
 )
 
+from .survival_tree import SurvivalTree
+from .random_survival_tree import RandomSurvivalForest
+from .gradient_boosting_survival import GradientBoostingSurvivalAnalysis
+
 __all__ = [
     # Non-parametric
     'KaplanMeierEstimator',
@@ -72,4 +76,9 @@ __all__ = [
     'LogNormalAFTFitter',
     'LogLogisticAFTFitter',
     'ExponentialFitter',
+
+    # ML Models
+    'SurvivalTree',
+    'RandomSurvivalForest',
+    'GradientBoostingSurvivalAnalysis',
 ]
