@@ -47,25 +47,25 @@ class KaplanMeierEstimator:
         self._is_fitted = False
         self.alpha_ = 0.05  # Default confidence level (95%)
     
-    def fit(self, 
-            durations: Union[np.ndarray, torch.Tensor], 
+    def fit(self,
+            durations: Union[np.ndarray, torch.Tensor],
             events: Union[np.ndarray, torch.Tensor],
             alpha: float = 0.05,
             weights: Optional[Union[np.ndarray, torch.Tensor]] = None) -> 'KaplanMeierEstimator':
         """
         Fit the Kaplan-Meier estimator to survival data.
-        
+
         Parameters:
         -----------
         durations : array-like
             Time to event or censoring for each subject
-        events : array-like  
+        events : array-like
             Event indicator (1 if event occurred, 0 if censored)
         alpha : float, default=0.05
             Significance level for confidence intervals (1-alpha confidence level)
         weights : array-like, optional
             Sample weights for each observation
-            
+
         Returns:
         --------
         self : KaplanMeierEstimator
@@ -74,138 +74,121 @@ class KaplanMeierEstimator:
         # Convert inputs to tensors and move to device
         durations = self._to_tensor(durations)
         events = self._to_tensor(events)
-        
+
         if weights is not None:
             weights = self._to_tensor(weights)
         else:
             weights = torch.ones_like(durations, device=self.device)
-        
+
         # Validation
         self._validate_input(durations, events, weights)
-        
+
         # Store alpha for confidence intervals
         self.alpha_ = alpha
-        
-        # Sort by durations
-        sorted_indices = torch.argsort(durations)
-        sorted_durations = durations[sorted_indices]
-        sorted_events = events[sorted_indices]
-        sorted_weights = weights[sorted_indices]
-        
-        # Get unique event times (only where events occurred)
-        event_mask = sorted_events == 1
-        if not torch.any(event_mask):
+
+        # Get unique times and aggregate counts - VECTORIZED for GPU
+        unique_times, inverse_indices = torch.unique(durations, sorted=True, return_inverse=True)
+        n_times = len(unique_times)
+
+        # Aggregate events and total observations at each unique time using scatter_add
+        events_at_time = torch.zeros(n_times, device=self.device, dtype=weights.dtype)
+        total_at_time = torch.zeros(n_times, device=self.device, dtype=weights.dtype)
+
+        events_at_time.scatter_add_(0, inverse_indices, weights * events)
+        total_at_time.scatter_add_(0, inverse_indices, weights)
+
+        # Calculate number at risk at each time point (cumulative sum from the end)
+        # n_at_risk[i] = sum of all observations at time >= unique_times[i]
+        at_risk = torch.flip(torch.cumsum(torch.flip(total_at_time, [0]), dim=0), [0])
+
+        # Filter to only times where events occurred
+        event_times_mask = events_at_time > 0
+
+        if not torch.any(event_times_mask):
             # No events occurred - everyone was censored
-            self.timeline_ = torch.tensor([sorted_durations.max().item()], device=self.device)
+            self.timeline_ = unique_times[-1:].clone()
             self.survival_function_ = torch.tensor([1.0], device=self.device)
-            self.at_risk_ = torch.tensor([torch.sum(sorted_weights).item()], device=self.device)
+            self.at_risk_ = at_risk[-1:].clone()
             self.events_ = torch.tensor([0.0], device=self.device)
             self.confidence_interval_ = torch.tensor([[1.0, 1.0]], device=self.device)
             self._is_fitted = True
             return self
-        
-        event_times = sorted_durations[event_mask]
-        unique_event_times = torch.unique(event_times)
-        
-        # Calculate survival function at each unique event time
-        timeline = []
-        survival_probs = []
-        at_risk_counts = []
-        event_counts = []
-        
-        current_survival = 1.0
-        
-        for t in unique_event_times:
-            # Count subjects at risk just before time t
-            at_risk_mask = sorted_durations >= t
-            n_at_risk = torch.sum(sorted_weights[at_risk_mask])
-            
-            # Count events exactly at time t
-            event_at_t_mask = (sorted_durations == t) & (sorted_events == 1)
-            n_events = torch.sum(sorted_weights[event_at_t_mask])
-            
-            if n_at_risk > 0:
-                # Calculate survival probability at this time point
-                survival_at_t = (n_at_risk - n_events) / n_at_risk
-                current_survival *= survival_at_t
-                
-                timeline.append(t.item())
-                survival_probs.append(current_survival.item())
-                at_risk_counts.append(n_at_risk.item())
-                event_counts.append(n_events.item())
-        
-        # Convert to tensors
-        self.timeline_ = torch.tensor(timeline, device=self.device)
-        self.survival_function_ = torch.tensor(survival_probs, device=self.device)
-        self.at_risk_ = torch.tensor(at_risk_counts, device=self.device)
-        self.events_ = torch.tensor(event_counts, device=self.device)
-        
+
+        # Extract only event times
+        self.timeline_ = unique_times[event_times_mask]
+        self.events_ = events_at_time[event_times_mask]
+        self.at_risk_ = at_risk[event_times_mask]
+
+        # Calculate survival probabilities using vectorized cumulative product
+        # S(t) = prod((n_i - d_i) / n_i) for all event times <= t
+        survival_factors = (self.at_risk_ - self.events_) / self.at_risk_
+        self.survival_function_ = torch.cumprod(survival_factors, dim=0)
+
         # Calculate confidence intervals using Greenwood's formula
         self._calculate_confidence_intervals()
-        
+
         self._is_fitted = True
         return self
     
     def _calculate_confidence_intervals(self):
         """
         Calculate confidence intervals using Greenwood's formula for variance estimation.
-        
+
         Var[log(-log(S(t)))] ≈ Σ(i: t_i ≤ t) d_i / (n_i * (n_i - d_i))
         """
         if len(self.timeline_) == 0:
             self.confidence_interval_ = None
             return
-        
+
         try:
             from scipy.stats import norm
         except ImportError:
             warnings.warn("scipy not available, skipping confidence intervals")
             self.confidence_interval_ = None
             return
-        
-        # Greenwood's variance formula
-        variance_terms = torch.zeros_like(self.timeline_, device=self.device)
-        
-        for i in range(len(self.timeline_)):
-            n_i = self.at_risk_[i]
-            d_i = self.events_[i]
-            
-            if n_i > d_i and d_i > 0:
-                variance_terms[i] = d_i / (n_i * (n_i - d_i))
-        
+
+        # Greenwood's variance formula - VECTORIZED
+        n_i = self.at_risk_
+        d_i = self.events_
+
+        # Compute variance terms where valid (n_i > d_i and d_i > 0)
+        valid_mask = (n_i > d_i) & (d_i > 0)
+        variance_terms = torch.where(
+            valid_mask,
+            d_i / (n_i * (n_i - d_i)),
+            torch.zeros_like(d_i)
+        )
+
         # Cumulative variance for Greenwood's formula
         cumulative_variance = torch.cumsum(variance_terms, dim=0)
-        
+
         # Calculate confidence intervals on log(-log(S(t))) scale
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=RuntimeWarning)
-            
-            # Avoid numerical issues
-            epsilon = 1e-15
-            safe_survival = torch.clamp(self.survival_function_, min=epsilon, max=1.0 - epsilon)
-            
-            # Greenwood's standard error
-            greenwood_se = torch.sqrt(cumulative_variance) / torch.abs(torch.log(safe_survival))
-            
-            # Z-score for confidence level
-            z_alpha = norm.ppf(1 - self.alpha_ / 2)
-            
-            # Log-log transformation
-            log_neg_log_s = torch.log(-torch.log(safe_survival))
-            
-            # Confidence intervals on transformed scale
-            upper_log_neg_log = log_neg_log_s + z_alpha * greenwood_se
-            lower_log_neg_log = log_neg_log_s - z_alpha * greenwood_se
-            
-            # Transform back to survival probability scale
-            upper_ci = torch.exp(-torch.exp(upper_log_neg_log))
-            lower_ci = torch.exp(-torch.exp(lower_log_neg_log))
-            
-            # Clamp to valid range [0, 1] and handle NaNs
-            upper_ci = torch.clamp(torch.nan_to_num(upper_ci, nan=1.0), 0.0, 1.0)
-            lower_ci = torch.clamp(torch.nan_to_num(lower_ci, nan=0.0), 0.0, 1.0)
-            
-            self.confidence_interval_ = torch.stack([lower_ci, upper_ci], dim=1)
+        # Avoid numerical issues
+        epsilon = 1e-15
+        safe_survival = torch.clamp(self.survival_function_, min=epsilon, max=1.0 - epsilon)
+
+        # Greenwood's standard error
+        greenwood_se = torch.sqrt(cumulative_variance) / torch.abs(torch.log(safe_survival))
+
+        # Z-score for confidence level
+        z_alpha = norm.ppf(1 - self.alpha_ / 2)
+
+        # Log-log transformation
+        log_neg_log_s = torch.log(-torch.log(safe_survival))
+
+        # Confidence intervals on transformed scale
+        upper_log_neg_log = log_neg_log_s + z_alpha * greenwood_se
+        lower_log_neg_log = log_neg_log_s - z_alpha * greenwood_se
+
+        # Transform back to survival probability scale
+        upper_ci = torch.exp(-torch.exp(upper_log_neg_log))
+        lower_ci = torch.exp(-torch.exp(lower_log_neg_log))
+
+        # Clamp to valid range [0, 1] and handle NaNs
+        upper_ci = torch.clamp(torch.nan_to_num(upper_ci, nan=1.0), 0.0, 1.0)
+        lower_ci = torch.clamp(torch.nan_to_num(lower_ci, nan=0.0), 0.0, 1.0)
+
+        self.confidence_interval_ = torch.stack([lower_ci, upper_ci], dim=1)
     
     def survival_function_at_times(self, times: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
         """
