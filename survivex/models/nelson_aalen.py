@@ -5,47 +5,43 @@ import warnings
 
 class NelsonAalenEstimator:
     """
-    Nelson-Aalen cumulative hazard estimator implemented from scratch with GPU support.
-    
+    Nelson-Aalen cumulative hazard estimator with optimized numpy implementation.
+
     The Nelson-Aalen estimator estimates the cumulative hazard function:
     H(t) = Σ(i: t_i ≤ t) d_i / n_i
-    
+
     where:
     - d_i = number of events at time t_i
     - n_i = number at risk just before t_i
-    
+
     The cumulative hazard is related to survival by: S(t) = exp(-H(t))
-    
+
     Advantages over Kaplan-Meier:
     - More stable with heavy censoring
     - Better for estimating hazard rates
     - Used in Cox model baseline hazard
-    
+
     References:
     -----------
     - Nelson, W. (1972). Theory and applications of hazard plotting for censored failure data
     - Aalen, O. (1978). Nonparametric estimation of partial transition probabilities in multiple decrement models
     - lifelines.NelsonAalenFitter
     """
-    
+
     def __init__(self, device: Optional[str] = None):
         """
         Initialize the Nelson-Aalen estimator.
-        
+
         Parameters:
         -----------
         device : str, optional
-            Device to run computations on ('cpu', 'cuda', 'mps').
-            If None, automatically selects best available device.
+            Device for storing results ('cpu', 'cuda', 'mps').
+            Defaults to 'cpu' since NA uses optimized numpy internally.
         """
+        # NA uses numpy internally for computation, CPU is fastest
         if device is None:
-            if torch.cuda.is_available():
-                device = 'cuda'
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                device = 'mps'
-            else:
-                device = 'cpu'
-        
+            device = 'cpu'
+
         self.device = torch.device(device)
         
         # Results storage
@@ -83,59 +79,78 @@ class NelsonAalenEstimator:
         self : NelsonAalenEstimator
             Fitted estimator
         """
-        # Convert inputs to tensors and move to device
-        durations = self._to_tensor(durations)
-        events = self._to_tensor(events)
+        # Convert to numpy for fast CPU computation
+        if isinstance(durations, torch.Tensor):
+            durations = durations.cpu().numpy()
+        else:
+            durations = np.asarray(durations, dtype=np.float64)
+
+        if isinstance(events, torch.Tensor):
+            events = events.cpu().numpy()
+        else:
+            events = np.asarray(events, dtype=np.float64)
 
         if weights is not None:
-            weights = self._to_tensor(weights)
+            if isinstance(weights, torch.Tensor):
+                weights = weights.cpu().numpy()
+            else:
+                weights = np.asarray(weights, dtype=np.float64)
         else:
-            weights = torch.ones_like(durations, device=self.device)
+            weights = np.ones_like(durations)
 
         # Validation
-        self._validate_input(durations, events, weights)
+        if len(durations) != len(events):
+            raise ValueError("durations and events must have the same length")
+        if np.any(durations < 0):
+            raise ValueError("durations must be non-negative")
 
-        # Store alpha for confidence intervals
         self.alpha_ = alpha
 
-        # Get unique times and aggregate counts - VECTORIZED for GPU
-        unique_times, inverse_indices = torch.unique(durations, sorted=True, return_inverse=True)
+        # Sort by time
+        order = np.argsort(durations)
+        t_sorted = durations[order]
+        e_sorted = events[order]
+        w_sorted = weights[order]
+
+        # Get unique times and aggregate using numpy (fast!)
+        unique_times, inverse = np.unique(t_sorted, return_inverse=True)
         n_times = len(unique_times)
 
-        # Aggregate events and total observations at each unique time using scatter_add
-        events_at_time = torch.zeros(n_times, device=self.device, dtype=weights.dtype)
-        total_at_time = torch.zeros(n_times, device=self.device, dtype=weights.dtype)
+        # Aggregate events and totals at each time
+        events_at_t = np.bincount(inverse, weights=w_sorted * e_sorted, minlength=n_times)
+        total_at_t = np.bincount(inverse, weights=w_sorted, minlength=n_times)
 
-        events_at_time.scatter_add_(0, inverse_indices, weights * events)
-        total_at_time.scatter_add_(0, inverse_indices, weights)
+        # Number at risk: cumsum from the end
+        at_risk = np.cumsum(total_at_t[::-1])[::-1]
 
-        # Calculate number at risk at each time point (cumulative sum from the end)
-        at_risk = torch.flip(torch.cumsum(torch.flip(total_at_time, [0]), dim=0), [0])
+        # Filter to event times only
+        event_mask = events_at_t > 0
 
-        # Filter to only times where events occurred
-        event_times_mask = events_at_time > 0
-
-        if not torch.any(event_times_mask):
-            # No events occurred - everyone was censored
-            self.timeline_ = unique_times[-1:].clone()
+        if not np.any(event_mask):
+            # No events - everyone censored
+            self.timeline_ = torch.tensor([unique_times[-1]], device=self.device, dtype=torch.float32)
             self.cumulative_hazard_ = torch.tensor([0.0], device=self.device)
-            self.at_risk_ = at_risk[-1:].clone()
+            self.at_risk_ = torch.tensor([at_risk[-1]], device=self.device, dtype=torch.float32)
             self.events_ = torch.tensor([0.0], device=self.device)
             self.confidence_interval_ = torch.tensor([[0.0, 0.0]], device=self.device)
             self._is_fitted = True
             return self
 
-        # Extract only event times
-        self.timeline_ = unique_times[event_times_mask]
-        self.events_ = events_at_time[event_times_mask]
-        self.at_risk_ = at_risk[event_times_mask]
+        timeline = unique_times[event_mask]
+        n_events = events_at_t[event_mask]
+        n_at_risk = at_risk[event_mask]
 
-        # Calculate cumulative hazard using vectorized cumsum
-        # H(t) = sum(d_i / n_i) for all event times <= t
-        hazard_increments = self.events_ / self.at_risk_
-        self.cumulative_hazard_ = torch.cumsum(hazard_increments, dim=0)
+        # Nelson-Aalen: H(t) = cumsum(d / n)
+        hazard_increments = n_events / n_at_risk
+        cumulative_hazard = np.cumsum(hazard_increments)
 
-        # Calculate confidence intervals using Aalen's variance formula
+        # Store as tensors
+        self.timeline_ = torch.tensor(timeline, device=self.device, dtype=torch.float32)
+        self.cumulative_hazard_ = torch.tensor(cumulative_hazard, device=self.device, dtype=torch.float32)
+        self.at_risk_ = torch.tensor(n_at_risk, device=self.device, dtype=torch.float32)
+        self.events_ = torch.tensor(n_events, device=self.device, dtype=torch.float32)
+
+        # Calculate confidence intervals
         self._calculate_confidence_intervals()
 
         self._is_fitted = True
@@ -161,51 +176,46 @@ class NelsonAalenEstimator:
             self.confidence_interval_ = None
             return
 
-        # Aalen's variance formula - VECTORIZED: Var[H(t)] = Σ d_i / n_i²
-        n_i = self.at_risk_
-        d_i = self.events_
+        # Use numpy for computation
+        n_i = self.at_risk_.cpu().numpy()
+        d_i = self.events_.cpu().numpy()
+        hazard = self.cumulative_hazard_.cpu().numpy()
 
-        # Compute variance terms where valid
-        valid_mask = (n_i > 0) & (d_i > 0)
-        variance_terms = torch.where(
-            valid_mask,
-            d_i / (n_i ** 2),
-            torch.zeros_like(d_i)
-        )
+        # Aalen's variance formula
+        with np.errstate(divide='ignore', invalid='ignore'):
+            variance_terms = np.where(
+                (n_i > 0) & (d_i > 0),
+                d_i / (n_i ** 2),
+                0.0
+            )
 
-        # Cumulative variance
-        cumulative_variance = torch.cumsum(variance_terms, dim=0)
+        cumulative_variance = np.cumsum(variance_terms)
+        standard_error = np.sqrt(cumulative_variance)
 
-        # Standard error
-        standard_error = torch.sqrt(cumulative_variance)
-
-        # Z-score for confidence level
         z_alpha = norm.ppf(1 - self.alpha_ / 2)
 
-        # Calculate confidence intervals on log scale for better properties
-        # Avoid log(0)
+        # Log transformation for CI
         epsilon = 1e-15
-        safe_hazard = torch.clamp(self.cumulative_hazard_, min=epsilon)
+        safe_hazard = np.clip(hazard, epsilon, None)
 
-        # Standard error on log scale: SE[log(H)] = SE[H] / H
-        log_se = standard_error / safe_hazard
+        with np.errstate(divide='ignore', invalid='ignore'):
+            log_se = standard_error / safe_hazard
 
-        # Log of cumulative hazard
-        log_hazard = torch.log(safe_hazard)
-
-        # Confidence intervals on log scale
+        log_hazard = np.log(safe_hazard)
         log_upper = log_hazard + z_alpha * log_se
         log_lower = log_hazard - z_alpha * log_se
 
-        # Transform back to hazard scale
-        upper_ci = torch.exp(log_upper)
-        lower_ci = torch.exp(log_lower)
+        upper_ci = np.exp(log_upper)
+        lower_ci = np.exp(log_lower)
 
-        # Clamp to reasonable range and handle NaNs
-        upper_ci = torch.nan_to_num(upper_ci, nan=safe_hazard[0].item() * 10)
-        lower_ci = torch.clamp(torch.nan_to_num(lower_ci, nan=0.0), 0.0)
+        # Handle NaN and clip
+        upper_ci = np.nan_to_num(upper_ci, nan=safe_hazard[0] * 10 if len(safe_hazard) > 0 else 1.0)
+        lower_ci = np.clip(np.nan_to_num(lower_ci, nan=0.0), 0.0, None)
 
-        self.confidence_interval_ = torch.stack([lower_ci, upper_ci], dim=1)
+        self.confidence_interval_ = torch.tensor(
+            np.stack([lower_ci, upper_ci], axis=1),
+            device=self.device, dtype=torch.float32
+        )
     
     def cumulative_hazard_at_times(self, times: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
         """

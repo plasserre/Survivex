@@ -5,34 +5,30 @@ import warnings
 
 class KaplanMeierEstimator:
     """
-    Kaplan-Meier survival probability estimator implemented from scratch with GPU support.
-    
+    Kaplan-Meier survival probability estimator with optimized numpy implementation.
+
     Based on the product-limit estimator:
     S(t) = ∏(i: t_i ≤ t) (n_i - d_i) / n_i
-    
+
     Reference implementations:
     - lifelines.KaplanMeierFitter
     - Original Kaplan & Meier (1958) paper
     """
-    
+
     def __init__(self, device: Optional[str] = None):
         """
         Initialize the Kaplan-Meier estimator.
-        
+
         Parameters:
         -----------
         device : str, optional
-            Device to run computations on ('cpu', 'cuda', 'mps').
-            If None, automatically selects best available device.
+            Device for storing results ('cpu', 'cuda', 'mps').
+            Defaults to 'cpu' since KM uses optimized numpy internally.
         """
+        # KM uses numpy internally for computation, CPU is fastest
         if device is None:
-            if torch.cuda.is_available():
-                device = 'cuda'
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                device = 'mps'
-            else:
-                device = 'cpu'
-        
+            device = 'cpu'
+
         self.device = torch.device(device)
         
         # Results storage
@@ -71,60 +67,78 @@ class KaplanMeierEstimator:
         self : KaplanMeierEstimator
             Fitted estimator
         """
-        # Convert inputs to tensors and move to device
-        durations = self._to_tensor(durations)
-        events = self._to_tensor(events)
+        # Convert to numpy for fast CPU computation
+        if isinstance(durations, torch.Tensor):
+            durations = durations.cpu().numpy()
+        else:
+            durations = np.asarray(durations, dtype=np.float64)
+
+        if isinstance(events, torch.Tensor):
+            events = events.cpu().numpy()
+        else:
+            events = np.asarray(events, dtype=np.float64)
 
         if weights is not None:
-            weights = self._to_tensor(weights)
+            if isinstance(weights, torch.Tensor):
+                weights = weights.cpu().numpy()
+            else:
+                weights = np.asarray(weights, dtype=np.float64)
         else:
-            weights = torch.ones_like(durations, device=self.device)
+            weights = np.ones_like(durations)
 
         # Validation
-        self._validate_input(durations, events, weights)
+        if len(durations) != len(events):
+            raise ValueError("durations and events must have the same length")
+        if np.any(durations < 0):
+            raise ValueError("durations must be non-negative")
 
-        # Store alpha for confidence intervals
         self.alpha_ = alpha
 
-        # Get unique times and aggregate counts - VECTORIZED for GPU
-        unique_times, inverse_indices = torch.unique(durations, sorted=True, return_inverse=True)
+        # Sort by time
+        order = np.argsort(durations)
+        t_sorted = durations[order]
+        e_sorted = events[order]
+        w_sorted = weights[order]
+
+        # Get unique event times and aggregate using numpy (fast!)
+        unique_times, inverse = np.unique(t_sorted, return_inverse=True)
         n_times = len(unique_times)
 
-        # Aggregate events and total observations at each unique time using scatter_add
-        events_at_time = torch.zeros(n_times, device=self.device, dtype=weights.dtype)
-        total_at_time = torch.zeros(n_times, device=self.device, dtype=weights.dtype)
+        # Aggregate events and totals at each time
+        events_at_t = np.bincount(inverse, weights=w_sorted * e_sorted, minlength=n_times)
+        total_at_t = np.bincount(inverse, weights=w_sorted, minlength=n_times)
 
-        events_at_time.scatter_add_(0, inverse_indices, weights * events)
-        total_at_time.scatter_add_(0, inverse_indices, weights)
+        # Number at risk: cumsum from the end
+        at_risk = np.cumsum(total_at_t[::-1])[::-1]
 
-        # Calculate number at risk at each time point (cumulative sum from the end)
-        # n_at_risk[i] = sum of all observations at time >= unique_times[i]
-        at_risk = torch.flip(torch.cumsum(torch.flip(total_at_time, [0]), dim=0), [0])
+        # Filter to event times only
+        event_mask = events_at_t > 0
 
-        # Filter to only times where events occurred
-        event_times_mask = events_at_time > 0
-
-        if not torch.any(event_times_mask):
-            # No events occurred - everyone was censored
-            self.timeline_ = unique_times[-1:].clone()
+        if not np.any(event_mask):
+            # No events - everyone censored
+            self.timeline_ = torch.tensor([unique_times[-1]], device=self.device, dtype=torch.float32)
             self.survival_function_ = torch.tensor([1.0], device=self.device)
-            self.at_risk_ = at_risk[-1:].clone()
+            self.at_risk_ = torch.tensor([at_risk[-1]], device=self.device, dtype=torch.float32)
             self.events_ = torch.tensor([0.0], device=self.device)
             self.confidence_interval_ = torch.tensor([[1.0, 1.0]], device=self.device)
             self._is_fitted = True
             return self
 
-        # Extract only event times
-        self.timeline_ = unique_times[event_times_mask]
-        self.events_ = events_at_time[event_times_mask]
-        self.at_risk_ = at_risk[event_times_mask]
+        timeline = unique_times[event_mask]
+        n_events = events_at_t[event_mask]
+        n_at_risk = at_risk[event_mask]
 
-        # Calculate survival probabilities using vectorized cumulative product
-        # S(t) = prod((n_i - d_i) / n_i) for all event times <= t
-        survival_factors = (self.at_risk_ - self.events_) / self.at_risk_
-        self.survival_function_ = torch.cumprod(survival_factors, dim=0)
+        # Kaplan-Meier: S(t) = cumprod((n - d) / n)
+        survival_factors = (n_at_risk - n_events) / n_at_risk
+        survival_probs = np.cumprod(survival_factors)
 
-        # Calculate confidence intervals using Greenwood's formula
+        # Store as tensors
+        self.timeline_ = torch.tensor(timeline, device=self.device, dtype=torch.float32)
+        self.survival_function_ = torch.tensor(survival_probs, device=self.device, dtype=torch.float32)
+        self.at_risk_ = torch.tensor(n_at_risk, device=self.device, dtype=torch.float32)
+        self.events_ = torch.tensor(n_events, device=self.device, dtype=torch.float32)
+
+        # Calculate confidence intervals
         self._calculate_confidence_intervals()
 
         self._is_fitted = True
@@ -147,48 +161,45 @@ class KaplanMeierEstimator:
             self.confidence_interval_ = None
             return
 
-        # Greenwood's variance formula - VECTORIZED
-        n_i = self.at_risk_
-        d_i = self.events_
+        # Use numpy for computation
+        n_i = self.at_risk_.cpu().numpy()
+        d_i = self.events_.cpu().numpy()
+        survival = self.survival_function_.cpu().numpy()
 
-        # Compute variance terms where valid (n_i > d_i and d_i > 0)
-        valid_mask = (n_i > d_i) & (d_i > 0)
-        variance_terms = torch.where(
-            valid_mask,
-            d_i / (n_i * (n_i - d_i)),
-            torch.zeros_like(d_i)
-        )
+        # Greenwood's variance formula
+        with np.errstate(divide='ignore', invalid='ignore'):
+            variance_terms = np.where(
+                (n_i > d_i) & (d_i > 0),
+                d_i / (n_i * (n_i - d_i)),
+                0.0
+            )
 
-        # Cumulative variance for Greenwood's formula
-        cumulative_variance = torch.cumsum(variance_terms, dim=0)
+        cumulative_variance = np.cumsum(variance_terms)
 
-        # Calculate confidence intervals on log(-log(S(t))) scale
-        # Avoid numerical issues
+        # Log-log transformation for CI
         epsilon = 1e-15
-        safe_survival = torch.clamp(self.survival_function_, min=epsilon, max=1.0 - epsilon)
+        safe_survival = np.clip(survival, epsilon, 1.0 - epsilon)
 
-        # Greenwood's standard error
-        greenwood_se = torch.sqrt(cumulative_variance) / torch.abs(torch.log(safe_survival))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            greenwood_se = np.sqrt(cumulative_variance) / np.abs(np.log(safe_survival))
 
-        # Z-score for confidence level
         z_alpha = norm.ppf(1 - self.alpha_ / 2)
+        log_neg_log_s = np.log(-np.log(safe_survival))
 
-        # Log-log transformation
-        log_neg_log_s = torch.log(-torch.log(safe_survival))
+        upper_log = log_neg_log_s + z_alpha * greenwood_se
+        lower_log = log_neg_log_s - z_alpha * greenwood_se
 
-        # Confidence intervals on transformed scale
-        upper_log_neg_log = log_neg_log_s + z_alpha * greenwood_se
-        lower_log_neg_log = log_neg_log_s - z_alpha * greenwood_se
+        upper_ci = np.exp(-np.exp(upper_log))
+        lower_ci = np.exp(-np.exp(lower_log))
 
-        # Transform back to survival probability scale
-        upper_ci = torch.exp(-torch.exp(upper_log_neg_log))
-        lower_ci = torch.exp(-torch.exp(lower_log_neg_log))
+        # Handle NaN and clip
+        upper_ci = np.clip(np.nan_to_num(upper_ci, nan=1.0), 0.0, 1.0)
+        lower_ci = np.clip(np.nan_to_num(lower_ci, nan=0.0), 0.0, 1.0)
 
-        # Clamp to valid range [0, 1] and handle NaNs
-        upper_ci = torch.clamp(torch.nan_to_num(upper_ci, nan=1.0), 0.0, 1.0)
-        lower_ci = torch.clamp(torch.nan_to_num(lower_ci, nan=0.0), 0.0, 1.0)
-
-        self.confidence_interval_ = torch.stack([lower_ci, upper_ci], dim=1)
+        self.confidence_interval_ = torch.tensor(
+            np.stack([lower_ci, upper_ci], axis=1),
+            device=self.device, dtype=torch.float32
+        )
     
     def survival_function_at_times(self, times: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
         """
