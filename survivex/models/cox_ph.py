@@ -4,6 +4,124 @@ from typing import Optional, Union, Tuple, Dict
 import warnings
 from dataclasses import dataclass
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
+import os
+
+# Try to import numba for JIT compilation
+try:
+    from numba import njit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    # Fallback decorator that does nothing
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        return decorator
+    prange = range
+
+
+# Numba-optimized Efron computation (compiled at first call)
+@njit(cache=True, fastmath=True)
+def _efron_loop_numba_serial(
+    beta_np, X_np, durations_np, events_np,
+    risk_scores, risk_cumsum_rev, weighted_X_cumsum_rev, weighted_XX_cumsum_rev,
+    unique_times, time_to_first_idx, event_indices_flat, event_indices_starts, event_indices_counts
+):
+    """
+    Serial Numba-optimized Efron computation (stable version).
+    """
+    n_samples, n_features = X_np.shape
+    n_unique = len(unique_times)
+
+    log_likelihood = 0.0
+    gradient = np.zeros(n_features)
+    hessian = np.zeros((n_features, n_features))
+
+    for t_idx in range(n_unique):
+        first_idx = time_to_first_idx[t_idx]
+        start = event_indices_starts[t_idx]
+        d_t = event_indices_counts[t_idx]
+
+        if d_t == 0:
+            continue
+
+        sum_risk = risk_cumsum_rev[first_idx]
+        sum_weighted_X = weighted_X_cumsum_rev[first_idx].copy()
+        sum_weighted_XX = weighted_XX_cumsum_rev[first_idx].copy()
+
+        # Get event indices for this time
+        event_idx_list = event_indices_flat[start:start + d_t]
+
+        # Get event data
+        X_events = np.empty((d_t, n_features))
+        risk_events = np.empty(d_t)
+        for i in range(d_t):
+            idx = event_idx_list[i]
+            risk_events[i] = risk_scores[idx]
+            for j in range(n_features):
+                X_events[i, j] = X_np[idx, j]
+
+        # Compute sums for events
+        sum_risk_events = 0.0
+        sum_X_events = np.zeros(n_features)
+        sum_weighted_X_events = np.zeros(n_features)
+        sum_weighted_XX_events = np.zeros((n_features, n_features))
+
+        for i in range(d_t):
+            sum_risk_events += risk_events[i]
+            for j in range(n_features):
+                sum_X_events[j] += X_events[i, j]
+                sum_weighted_X_events[j] += X_events[i, j] * risk_events[i]
+                for k in range(n_features):
+                    sum_weighted_XX_events[j, k] += X_events[i, j] * X_events[i, k] * risk_events[i]
+
+        # Compute eta contribution
+        eta_sum = 0.0
+        for i in range(d_t):
+            for j in range(n_features):
+                eta_sum += X_events[i, j] * beta_np[j]
+
+        if d_t == 1:
+            # No ties - simple case
+            log_likelihood += eta_sum - np.log(sum_risk)
+
+            for j in range(n_features):
+                weighted_mean_j = sum_weighted_X[j] / sum_risk
+                gradient[j] += sum_X_events[j] - weighted_mean_j
+
+            for j in range(n_features):
+                for k in range(n_features):
+                    weighted_mean_jk = sum_weighted_XX[j, k] / sum_risk
+                    outer_jk = (sum_weighted_X[j] / sum_risk) * (sum_weighted_X[k] / sum_risk)
+                    hessian[j, k] -= weighted_mean_jk - outer_jk
+        else:
+            # Ties - Efron approximation
+            log_likelihood += eta_sum
+            for j in range(n_features):
+                gradient[j] += sum_X_events[j]
+
+            for l in range(d_t):
+                frac = l / d_t
+                denom = sum_risk - frac * sum_risk_events
+
+                log_likelihood -= np.log(denom)
+
+                adj_weighted_X = np.empty(n_features)
+                for j in range(n_features):
+                    adj_weighted_X[j] = (sum_weighted_X[j] - frac * sum_weighted_X_events[j]) / denom
+                    gradient[j] -= adj_weighted_X[j]
+
+                for j in range(n_features):
+                    for k in range(n_features):
+                        adj_weighted_XX_jk = (sum_weighted_XX[j, k] - frac * sum_weighted_XX_events[j, k]) / denom
+                        outer_jk = adj_weighted_X[j] * adj_weighted_X[k]
+                        hessian[j, k] -= adj_weighted_XX_jk - outer_jk
+
+    return log_likelihood, gradient, hessian
+
 
 @dataclass
 class CoxPHResult:
@@ -259,22 +377,25 @@ class CoxPHModel:
             try:
                 # Compute Newton direction
                 delta = torch.linalg.solve(hessian, gradient)
-                
+
                 # Line search to ensure likelihood increases
+                # Use compute_hessian=False for line search (only need log-likelihood)
                 step_size = 1.0
                 beta_new = beta - step_size * delta
                 log_lik_new, _, _ = self._compute_derivatives(
-                    beta_new, X_sorted, durations_sorted, events_sorted, start_times_sorted
+                    beta_new, X_sorted, durations_sorted, events_sorted, start_times_sorted,
+                    compute_hessian=False
                 )
-                
+
                 # Backtracking line search
                 while log_lik_new < log_lik and step_size > 1e-8:
                     step_size *= 0.5
                     beta_new = beta - step_size * delta
                     log_lik_new, _, _ = self._compute_derivatives(
-                        beta_new, X_sorted, durations_sorted, events_sorted, start_times_sorted
+                        beta_new, X_sorted, durations_sorted, events_sorted, start_times_sorted,
+                        compute_hessian=False
                     )
-                
+
                 beta = beta_new
                 
             except RuntimeError:
@@ -333,148 +454,289 @@ class CoxPHModel:
                         X: torch.Tensor,
                         durations: torch.Tensor,
                         events: torch.Tensor,
-                        start_times: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                        start_times: Optional[torch.Tensor] = None,
+                        compute_hessian: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Compute log partial likelihood, gradient, and Hessian.
-        
+        Compute log partial likelihood, gradient, and Hessian using vectorized operations.
+
+        Uses reverse cumulative sums for efficient O(n) computation instead of O(n²) loops.
+        For CPU, uses optimized numpy; for GPU, uses torch.
+
         Parameters:
         -----------
-        beta : torch.Tensor, shape (n_features,)
-            Current coefficient estimates
-        X : torch.Tensor, shape (n_samples, n_features)
-            Standardized covariate matrix (sorted by time)
-        durations : torch.Tensor, shape (n_samples,)
-            Sorted event times
-        events : torch.Tensor, shape (n_samples,)
-            Event indicators (sorted)
-        start_times : torch.Tensor, shape (n_samples,), optional
-            Start times for counting process. If None, assumes all start at 0.
-        
-        Returns:
-        --------
-        log_likelihood : torch.Tensor (scalar)
-        gradient : torch.Tensor, shape (n_features,)
-        hessian : torch.Tensor, shape (n_features, n_features)
+        compute_hessian : bool
+            If False, skip Hessian computation (faster for line search).
         """
+        # Use numpy-based implementation for CPU (much faster due to no torch overhead in loops)
+        if self.device.type == 'cpu':
+            return self._compute_derivatives_numpy(beta, X, durations, events, start_times, compute_hessian)
+        else:
+            return self._compute_derivatives_torch(beta, X, durations, events, start_times, compute_hessian)
 
+    def _compute_derivatives_numpy(self,
+                        beta: torch.Tensor,
+                        X: torch.Tensor,
+                        durations: torch.Tensor,
+                        events: torch.Tensor,
+                        start_times: Optional[torch.Tensor] = None,
+                        compute_hessian: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Numpy-based implementation for fast CPU computation.
+        Uses Numba JIT compilation for Efron method when available.
+
+        Parameters:
+        -----------
+        compute_hessian : bool
+            If False, skip expensive Hessian computation (O(n*p²)) - useful for line search.
+        """
+        # Convert to numpy
+        beta_np = beta.cpu().numpy().astype(np.float64)
+        X_np = X.cpu().numpy().astype(np.float64)
+        durations_np = durations.cpu().numpy().astype(np.float64)
+        events_np = events.cpu().numpy().astype(np.float64)
+
+        n_samples, n_features = X_np.shape
+
+        # Compute risk scores: exp(β'X)
+        eta = X_np @ beta_np
+        risk_scores = np.exp(eta)
+
+        # Reverse cumsum of risk scores
+        risk_cumsum_rev = np.cumsum(risk_scores[::-1])[::-1].copy()
+
+        # Reverse cumsum of weighted X (always needed for gradient)
+        weighted_X = X_np * risk_scores[:, np.newaxis]
+        weighted_X_cumsum_rev = np.cumsum(weighted_X[::-1], axis=0)[::-1].copy()
+
+        # For Hessian: reverse cumsum of X_j X_j^T * exp(β'X_j) - EXPENSIVE
+        # Only compute if needed (skip during line search)
+        if compute_hessian:
+            weighted_XX = X_np[:, :, np.newaxis] * X_np[:, np.newaxis, :] * risk_scores[:, np.newaxis, np.newaxis]
+            weighted_XX_cumsum_rev = np.cumsum(weighted_XX[::-1], axis=0)[::-1].copy()
+        else:
+            weighted_XX_cumsum_rev = None
+
+        # Check for ties - if no ties, use fast vectorized Breslow (equivalent to Efron)
+        event_mask = events_np == 1
+        event_times = durations_np[event_mask]
+        unique_times_check, counts = np.unique(event_times, return_counts=True)
+        max_ties = np.max(counts) if len(counts) > 0 else 1
+        has_ties = max_ties > 1
+
+        # Use vectorized Breslow if no ties OR if explicitly requested
+        if self.tie_method == 'breslow' or not has_ties:
+            # Breslow - fully vectorized (also exact for Efron when no ties)
+            log_likelihood = np.sum(eta[event_mask] - np.log(risk_cumsum_rev[event_mask]))
+            weighted_mean_X = weighted_X_cumsum_rev[event_mask] / risk_cumsum_rev[event_mask, np.newaxis]
+            gradient = np.sum(X_np[event_mask] - weighted_mean_X, axis=0)
+
+            if compute_hessian:
+                risk_at_events = risk_cumsum_rev[event_mask, np.newaxis, np.newaxis]
+                weighted_mean_XX = weighted_XX_cumsum_rev[event_mask] / risk_at_events
+                outer_mean = weighted_mean_X[:, :, np.newaxis] * weighted_mean_X[:, np.newaxis, :]
+                hessian = -np.sum(weighted_mean_XX - outer_mean, axis=0)
+            else:
+                hessian = np.zeros((n_features, n_features))
+
+        else:  # efron with ties
+            # For Efron with ties, we need weighted_XX (can't skip for Hessian)
+            if weighted_XX_cumsum_rev is None:
+                weighted_XX = X_np[:, :, np.newaxis] * X_np[:, np.newaxis, :] * risk_scores[:, np.newaxis, np.newaxis]
+                weighted_XX_cumsum_rev = np.cumsum(weighted_XX[::-1], axis=0)[::-1].copy()
+
+            # Efron - use Numba-optimized implementation if available
+            event_indices = np.where(event_mask)[0]
+            unique_times = unique_times_check
+            n_unique = len(unique_times)
+
+            # Pre-compute indices for Numba
+            # For each unique time: first index in sorted array and event indices
+            time_to_first_idx = np.zeros(n_unique, dtype=np.int64)
+            event_indices_list = []
+
+            for t_idx, t in enumerate(unique_times):
+                time_mask = durations_np == t
+                time_to_first_idx[t_idx] = np.where(time_mask)[0][0]
+                event_at_t = time_mask & event_mask
+                event_indices_list.append(np.where(event_at_t)[0])
+
+            if NUMBA_AVAILABLE:
+                # Use Numba implementation
+                # Flatten event indices for Numba compatibility
+                event_indices_flat = np.concatenate(event_indices_list) if event_indices_list else np.array([], dtype=np.int64)
+                event_indices_starts = np.zeros(n_unique, dtype=np.int64)
+                event_indices_counts = np.zeros(n_unique, dtype=np.int64)
+
+                offset = 0
+                for t_idx in range(n_unique):
+                    event_indices_starts[t_idx] = offset
+                    event_indices_counts[t_idx] = len(event_indices_list[t_idx])
+                    offset += event_indices_counts[t_idx]
+
+                # Use serial version (more stable, parallel caused crashes on some systems)
+                log_likelihood, gradient, hessian = _efron_loop_numba_serial(
+                    beta_np, X_np, durations_np, events_np,
+                    risk_scores, risk_cumsum_rev, weighted_X_cumsum_rev, weighted_XX_cumsum_rev,
+                    unique_times, time_to_first_idx, event_indices_flat, event_indices_starts, event_indices_counts
+                )
+            else:
+                # Fallback: optimized numpy implementation
+                log_likelihood = 0.0
+                gradient = np.zeros(n_features)
+                hessian = np.zeros((n_features, n_features))
+
+                for t_idx, t in enumerate(unique_times):
+                    first_idx = time_to_first_idx[t_idx]
+                    event_idx = event_indices_list[t_idx]
+                    d_t = len(event_idx)
+
+                    if d_t == 0:
+                        continue
+
+                    sum_risk = risk_cumsum_rev[first_idx]
+                    sum_weighted_X = weighted_X_cumsum_rev[first_idx]
+                    sum_weighted_XX = weighted_XX_cumsum_rev[first_idx]
+
+                    X_events = X_np[event_idx]
+                    risk_events = risk_scores[event_idx]
+
+                    sum_risk_events = np.sum(risk_events)
+                    sum_X_events = np.sum(X_events, axis=0)
+                    sum_weighted_X_events = np.sum(X_events * risk_events[:, np.newaxis], axis=0)
+                    sum_weighted_XX_events = np.einsum('ij,ik,i->jk', X_events, X_events, risk_events)
+
+                    eta_sum = np.sum(X_events @ beta_np)
+
+                    if d_t == 1:
+                        log_likelihood += eta_sum - np.log(sum_risk)
+                        weighted_mean = sum_weighted_X / sum_risk
+                        gradient += sum_X_events - weighted_mean
+                        weighted_mean_XX = sum_weighted_XX / sum_risk
+                        hessian -= weighted_mean_XX - np.outer(weighted_mean, weighted_mean)
+                    else:
+                        l_vals = np.arange(d_t, dtype=np.float64)
+                        fracs = l_vals / d_t
+                        denoms = sum_risk - fracs * sum_risk_events
+
+                        log_likelihood += eta_sum - np.sum(np.log(denoms))
+
+                        # Vectorized gradient and hessian
+                        adj_weighted_X_all = (sum_weighted_X - fracs[:, np.newaxis] * sum_weighted_X_events) / denoms[:, np.newaxis]
+                        gradient += sum_X_events - np.sum(adj_weighted_X_all, axis=0)
+
+                        adj_weighted_XX_all = (sum_weighted_XX - fracs[:, np.newaxis, np.newaxis] * sum_weighted_XX_events) / denoms[:, np.newaxis, np.newaxis]
+                        outer_all = adj_weighted_X_all[:, :, np.newaxis] * adj_weighted_X_all[:, np.newaxis, :]
+                        hessian -= np.sum(adj_weighted_XX_all - outer_all, axis=0)
+
+        # Convert back to torch
+        return (
+            torch.tensor(log_likelihood, device=self.device, dtype=torch.float64),
+            torch.tensor(gradient, device=self.device, dtype=torch.float64),
+            torch.tensor(hessian, device=self.device, dtype=torch.float64)
+        )
+
+    def _compute_derivatives_torch(self,
+                        beta: torch.Tensor,
+                        X: torch.Tensor,
+                        durations: torch.Tensor,
+                        events: torch.Tensor,
+                        start_times: Optional[torch.Tensor] = None,
+                        compute_hessian: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Torch-based implementation for GPU computation.
+        """
         n_samples, n_features = X.shape
 
-        # If start_times not provided, assume everyone starts at 0
-        if start_times is None:
-            start_times = torch.zeros_like(durations)
-        
-        
         # Compute risk scores: exp(β'X)
-        risk_scores = torch.exp(torch.matmul(X, beta))
-        
-        # Initialize
-        log_likelihood = torch.tensor(0.0, device=self.device, dtype=torch.float64)
-        gradient = torch.zeros(n_features, device=self.device, dtype=torch.float64)
-        hessian = torch.zeros((n_features, n_features), device=self.device, dtype=torch.float64)
-        
-        # Find unique event times and handle ties
-        unique_times = torch.unique(durations[events == 1])
-        
-        for t in unique_times:
-            # Risk set: subjects with duration >= t
-            # at_risk_mask = durations >= t
-            at_risk_mask = (start_times < t) & (durations >= t)
-            
-            # Event set: subjects with event at time t
-            event_mask = (durations == t) & (events == 1)
-            
-            if not torch.any(event_mask):
-                continue
-            
-            # Number of events at this time
-            d_t = torch.sum(event_mask).item()
-            
-            # Risk scores in risk set
-            risk_at_risk = risk_scores[at_risk_mask]
-            X_at_risk = X[at_risk_mask]
-            
-            # Covariates and risk scores for events at this time
-            X_events = X[event_mask]
-            risk_events = risk_scores[event_mask]
-            
-            if self.tie_method == 'breslow':
-                # Breslow approximation
-                # L(β) = exp(β'Σj∈Dt Xj) / (Σk∈R(t) exp(β'Xk))^dt
-                
-                sum_risk_at_risk = torch.sum(risk_at_risk)
-                
-                # Log-likelihood contribution
-                log_lik_numerator = torch.sum(torch.matmul(X_events, beta))
-                log_lik_denominator = d_t * torch.log(sum_risk_at_risk)
-                log_likelihood += log_lik_numerator - log_lik_denominator
-                
-                # Gradient contribution
-                # U(β) = Σj∈Dt Xj - dt × (Σk∈R(t) Xk exp(β'Xk)) / (Σk∈R(t) exp(β'Xk))
-                weighted_mean_X = torch.sum(X_at_risk * risk_at_risk.unsqueeze(1), dim=0) / sum_risk_at_risk
-                gradient += torch.sum(X_events, dim=0) - d_t * weighted_mean_X
-                
-                # Hessian contribution
-                # H(β) = -dt × Var[X | R(t)]
-                # Var[X] = E[X²] - E[X]²
-                weighted_mean_X_squared = torch.sum(
-                    X_at_risk.unsqueeze(2) * X_at_risk.unsqueeze(1) * risk_at_risk.unsqueeze(1).unsqueeze(2),
-                    dim=0
-                ) / sum_risk_at_risk
-                variance_matrix = weighted_mean_X_squared - torch.outer(weighted_mean_X, weighted_mean_X)
-                hessian -= d_t * variance_matrix
-                
-            else:  # efron
-                # Efron approximation (more accurate for ties)
-                # L(β) = exp(β'Σj∈Dt Xj) / ∏l=0^(dt-1) (Σk∈R(t) exp(β'Xk) - (l/dt)Σk∈Dt exp(β'Xk))
-                
-                sum_risk_at_risk = torch.sum(risk_at_risk)
+        eta = torch.matmul(X, beta)
+        risk_scores = torch.exp(eta)
+
+        # Reverse cumsum of risk scores
+        risk_cumsum_rev = torch.flip(torch.cumsum(torch.flip(risk_scores, [0]), dim=0), [0])
+
+        # Reverse cumsum of weighted X (always needed for gradient)
+        weighted_X = X * risk_scores.unsqueeze(1)
+        weighted_X_cumsum_rev = torch.flip(torch.cumsum(torch.flip(weighted_X, [0]), dim=0), [0])
+
+        # For Hessian: reverse cumsum of X_j X_j^T * exp(β'X_j) - EXPENSIVE
+        if compute_hessian:
+            weighted_XX = X.unsqueeze(2) * X.unsqueeze(1) * risk_scores.unsqueeze(1).unsqueeze(2)
+            weighted_XX_cumsum_rev = torch.flip(torch.cumsum(torch.flip(weighted_XX, [0]), dim=0), [0])
+        else:
+            weighted_XX_cumsum_rev = None
+
+        if self.tie_method == 'breslow':
+            # Breslow - fully vectorized
+            event_mask = events == 1
+
+            log_likelihood = torch.sum(eta[event_mask] - torch.log(risk_cumsum_rev[event_mask]))
+            weighted_mean_X = weighted_X_cumsum_rev[event_mask] / risk_cumsum_rev[event_mask].unsqueeze(1)
+            gradient = torch.sum(X[event_mask] - weighted_mean_X, dim=0)
+
+            if compute_hessian:
+                risk_at_events = risk_cumsum_rev[event_mask].unsqueeze(1).unsqueeze(2)
+                weighted_mean_XX = weighted_XX_cumsum_rev[event_mask] / risk_at_events
+                outer_mean = weighted_mean_X.unsqueeze(2) * weighted_mean_X.unsqueeze(1)
+                hessian = -torch.sum(weighted_mean_XX - outer_mean, dim=0)
+            else:
+                hessian = torch.zeros((n_features, n_features), device=self.device, dtype=torch.float64)
+
+        else:  # efron
+            # Efron - loop over unique times (hard to fully vectorize)
+            event_mask = events == 1
+            event_times = durations[event_mask]
+            unique_times, inverse_indices = torch.unique(event_times, return_inverse=True)
+
+            log_likelihood = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+            gradient = torch.zeros(n_features, device=self.device, dtype=torch.float64)
+            hessian = torch.zeros((n_features, n_features), device=self.device, dtype=torch.float64)
+
+            for t in unique_times:
+                time_mask = durations == t
+                event_at_t = time_mask & event_mask
+
+                first_idx = torch.where(time_mask)[0][0]
+
+                sum_risk = risk_cumsum_rev[first_idx]
+                sum_weighted_X = weighted_X_cumsum_rev[first_idx]
+                sum_weighted_XX = weighted_XX_cumsum_rev[first_idx]
+
+                X_events = X[event_at_t]
+                risk_events = risk_scores[event_at_t]
+                d_t = X_events.shape[0]
+
+                if d_t == 0:
+                    continue
+
                 sum_risk_events = torch.sum(risk_events)
-                
-                # Log-likelihood contribution
-                log_lik_numerator = torch.sum(torch.matmul(X_events, beta))
-                log_lik_denominator = 0.0
-                
-                for l in range(d_t):
-                    denominator_l = sum_risk_at_risk - (l / d_t) * sum_risk_events
-                    log_lik_denominator += torch.log(denominator_l)
-                
-                log_likelihood += log_lik_numerator - log_lik_denominator
-                
-                # Gradient contribution
-                gradient += torch.sum(X_events, dim=0)
-                
-                for l in range(d_t):
-                    denominator_l = sum_risk_at_risk - (l / d_t) * sum_risk_events
-                    
-                    # Weighted mean of X in modified risk set
-                    weighted_X_risk = torch.sum(X_at_risk * risk_at_risk.unsqueeze(1), dim=0)
-                    weighted_X_events = (l / d_t) * torch.sum(X_events * risk_events.unsqueeze(1), dim=0)
-                    weighted_mean_X = (weighted_X_risk - weighted_X_events) / denominator_l
-                    
-                    gradient -= weighted_mean_X
-                
-                # Hessian contribution (similar structure)
-                for l in range(d_t):
-                    denominator_l = sum_risk_at_risk - (l / d_t) * sum_risk_events
-                    
-                    # Compute weighted second moments
-                    weighted_XX_risk = torch.sum(
-                        X_at_risk.unsqueeze(2) * X_at_risk.unsqueeze(1) * risk_at_risk.unsqueeze(1).unsqueeze(2),
-                        dim=0
-                    )
-                    weighted_XX_events = (l / d_t) * torch.sum(
-                        X_events.unsqueeze(2) * X_events.unsqueeze(1) * risk_events.unsqueeze(1).unsqueeze(2),
-                        dim=0
-                    )
-                    weighted_mean_XX = (weighted_XX_risk - weighted_XX_events) / denominator_l
-                    
-                    weighted_X_risk = torch.sum(X_at_risk * risk_at_risk.unsqueeze(1), dim=0)
-                    weighted_X_events = (l / d_t) * torch.sum(X_events * risk_events.unsqueeze(1), dim=0)
-                    weighted_mean_X = (weighted_X_risk - weighted_X_events) / denominator_l
-                    
-                    variance_matrix = weighted_mean_XX - torch.outer(weighted_mean_X, weighted_mean_X)
-                    hessian -= variance_matrix
-        
+                sum_X_events = torch.sum(X_events, dim=0)
+                sum_weighted_X_events = torch.sum(X_events * risk_events.unsqueeze(1), dim=0)
+                sum_weighted_XX_events = torch.sum(
+                    X_events.unsqueeze(2) * X_events.unsqueeze(1) * risk_events.unsqueeze(1).unsqueeze(2),
+                    dim=0
+                )
+
+                if d_t == 1:
+                    log_likelihood += torch.sum(torch.matmul(X_events, beta)) - torch.log(sum_risk)
+                    weighted_mean = sum_weighted_X / sum_risk
+                    gradient += sum_X_events - weighted_mean
+                    weighted_mean_XX = sum_weighted_XX / sum_risk
+                    hessian -= weighted_mean_XX - torch.outer(weighted_mean, weighted_mean)
+                else:
+                    l_vals = torch.arange(d_t, device=self.device, dtype=torch.float64)
+                    fracs = l_vals / d_t
+
+                    denoms = sum_risk - fracs * sum_risk_events
+
+                    log_likelihood += torch.sum(torch.matmul(X_events, beta)) - torch.sum(torch.log(denoms))
+
+                    adj_weighted_X_all = (sum_weighted_X.unsqueeze(0) - fracs.unsqueeze(1) * sum_weighted_X_events.unsqueeze(0)) / denoms.unsqueeze(1)
+                    gradient += sum_X_events - torch.sum(adj_weighted_X_all, dim=0)
+
+                    adj_weighted_XX_all = (sum_weighted_XX.unsqueeze(0) - fracs.unsqueeze(1).unsqueeze(2) * sum_weighted_XX_events.unsqueeze(0)) / denoms.unsqueeze(1).unsqueeze(2)
+                    outer_all = adj_weighted_X_all.unsqueeze(2) * adj_weighted_X_all.unsqueeze(1)
+                    hessian -= torch.sum(adj_weighted_XX_all - outer_all, dim=0)
+
         return log_likelihood, gradient, hessian
     
     def _estimate_baseline_hazard(self,
@@ -484,60 +746,61 @@ class CoxPHModel:
                              events: torch.Tensor,
                              start_times: Optional[torch.Tensor] = None):
         """
-        Estimate baseline hazard using Breslow estimator.
-        
-        Parameters:
-        -----------
-        beta : torch.Tensor
-            Estimated coefficients (on original scale)
-        X : torch.Tensor
-            Original covariate matrix
-        durations : torch.Tensor
-            Original durations
-        events : torch.Tensor
-            Original events
-        start_times : torch.Tensor, optional
-            Start times for counting process. If None, assumes all start at 0.
+        Estimate baseline hazard using Breslow estimator (fully vectorized).
         """
-        # If start_times not provided, assume everyone starts at 0
-        if start_times is None:
-            start_times = torch.zeros_like(durations)
-        # CRITICAL: Compute risk scores using centered X to match training
-        # During training, we used X_standardized = (X - X_mean) / X_std
-        # and beta_original = beta_std / X_std
-        # So: X_standardized @ beta_std = (X - X_mean) @ beta_original
-        X_centered = X - self.X_mean_
-        risk_scores = torch.exp(torch.matmul(X_centered, beta))
-        
+        # Use numpy for fast computation
+        X_np = X.cpu().numpy()
+        X_mean_np = self.X_mean_.cpu().numpy()
+        beta_np = beta.cpu().numpy()
+        durations_np = durations.cpu().numpy()
+        events_np = events.cpu().numpy()
+
+        # Compute risk scores using centered X
+        X_centered = X_np - X_mean_np
+        risk_scores = np.exp(X_centered @ beta_np)
+
+        # Sort by duration
+        order = np.argsort(durations_np)
+        dur_sorted = durations_np[order]
+        evt_sorted = events_np[order]
+        risk_sorted = risk_scores[order]
+
         # Get unique event times
-        event_times = durations[events == 1]
-        unique_times = torch.unique(event_times)
-        
-        baseline_hazard = []
-        timeline = []
-        
-        for t in unique_times:
-            # Risk set
-            # at_risk_mask = durations >= t
-            at_risk_mask = (start_times < t) & (durations >= t)
-            sum_risk = torch.sum(risk_scores[at_risk_mask])
-            
-            # Number of events at this time
-            event_mask = (durations == t) & (events == 1)
-            d_t = torch.sum(event_mask)
-            
-            # Breslow estimator: h₀(t) = d_t / Σ risk
-            h0_t = d_t / sum_risk
-            
-            timeline.append(t.item())
-            baseline_hazard.append(h0_t.item())
-        
-        self.timeline_ = torch.tensor(timeline, device=self.device)
-        self.baseline_hazard_ = torch.tensor(baseline_hazard, device=self.device)
-        
+        event_mask = evt_sorted == 1
+        event_times = dur_sorted[event_mask]
+        unique_times, inverse = np.unique(event_times, return_inverse=True)
+        n_unique = len(unique_times)
+
+        if n_unique == 0:
+            # No events
+            self.timeline_ = torch.tensor([], device=self.device, dtype=torch.float64)
+            self.baseline_hazard_ = torch.tensor([], device=self.device, dtype=torch.float64)
+            self.baseline_cumulative_hazard_ = torch.tensor([], device=self.device, dtype=torch.float64)
+            self.baseline_survival_ = torch.tensor([], device=self.device, dtype=torch.float64)
+            return
+
+        # Count events at each unique time
+        d_t = np.bincount(inverse, minlength=n_unique).astype(np.float64)
+
+        # Compute risk sums using reverse cumsum
+        risk_cumsum_rev = np.cumsum(risk_sorted[::-1])[::-1]
+
+        # For each unique time, get the index of first occurrence using searchsorted
+        first_indices = np.searchsorted(dur_sorted, unique_times)
+
+        # Get risk sums at those indices
+        sum_risks = risk_cumsum_rev[first_indices]
+
+        # Baseline hazard: d_t / sum_risk
+        baseline_hazard = d_t / sum_risks
+
+        # Store as tensors
+        self.timeline_ = torch.tensor(unique_times, device=self.device, dtype=torch.float64)
+        self.baseline_hazard_ = torch.tensor(baseline_hazard, device=self.device, dtype=torch.float64)
+
         # Cumulative baseline hazard
         self.baseline_cumulative_hazard_ = torch.cumsum(self.baseline_hazard_, dim=0)
-        
+
         # Baseline survival function: S₀(t) = exp(-H₀(t))
         self.baseline_survival_ = torch.exp(-self.baseline_cumulative_hazard_)
     
@@ -690,61 +953,97 @@ class CoxPHModel:
                                durations: torch.Tensor,
                                events: torch.Tensor) -> float:
         """
-        Compute concordance index (C-index).
-        
+        Compute concordance index (C-index) using O(n log n) algorithm.
+
         For all pairs (i,j) where ti < tj and delta_i=1:
         - Concordant if risk(i) > risk(j)
         - Discordant if risk(i) < risk(j)
         - Tie if risk(i) = risk(j)
-        
+
         C-index = (concordant + 0.5*ties) / total_pairs
-        
-        Parameters:
-        -----------
-        beta : torch.Tensor
-            Fitted coefficients
-        X : torch.Tensor
-            Covariate matrix
-        durations : torch.Tensor
-            Event/censoring times
-        events : torch.Tensor
-            Event indicators
+
+        Uses efficient sorting-based algorithm instead of O(n²) pairwise comparison.
+        Correctly handles tied durations by processing duration groups together.
         """
-        # Compute risk scores directly
-        risk_scores = torch.exp(torch.matmul(X, beta))
-        
-        # Move to CPU for computation
-        durations = durations.cpu()
-        events = events.cpu()
-        risk_scores = risk_scores.cpu()
-        
+        # Compute risk scores and move to numpy for fast computation
+        risk_scores = torch.exp(torch.matmul(X, beta)).cpu().numpy()
+        durations_np = durations.cpu().numpy()
+        events_np = events.cpu().numpy()
+
+        n = len(durations_np)
+        if np.sum(events_np) == 0:
+            return 0.5
+
+        # Sort by duration (primary) and by -risk (secondary for tie-breaking)
+        order = np.lexsort((-risk_scores, durations_np))
+        durations_sorted = durations_np[order]
+        events_sorted = events_np[order]
+        risk_sorted = risk_scores[order]
+
+        # Get unique risk values and their ranks
+        unique_risks, risk_ranks = np.unique(risk_sorted, return_inverse=True)
+        n_unique_risks = len(unique_risks)
+
+        # Binary indexed tree (Fenwick tree) for efficient prefix sums
+        bit = np.zeros(n_unique_risks + 1, dtype=np.int64)
+
+        def bit_update(idx, delta=1):
+            idx += 1
+            while idx <= n_unique_risks:
+                bit[idx] += delta
+                idx += idx & (-idx)
+
+        def bit_query(idx):
+            idx += 1
+            s = 0
+            while idx > 0:
+                s += bit[idx]
+                idx -= idx & (-idx)
+            return s
+
         concordant = 0
         discordant = 0
-        ties = 0
-        total_pairs = 0
-        
-        n = len(durations)
-        
-        for i in range(n):
-            if events[i] == 0:  # Only consider pairs where i had event
-                continue
-            
-            for j in range(n):
-                if durations[i] < durations[j]:  # i failed before j
-                    total_pairs += 1
-                    
-                    if risk_scores[i] > risk_scores[j]:
-                        concordant += 1
-                    elif risk_scores[i] < risk_scores[j]:
-                        discordant += 1
-                    else:
-                        ties += 1
-        
+        tied_risk = 0
+
+        # Get unique durations and process each group
+        unique_durations = np.unique(durations_sorted)
+
+        # Process from longest to shortest duration
+        for dur in unique_durations[::-1]:
+            # Find indices with this duration
+            dur_mask = durations_sorted == dur
+            dur_indices = np.where(dur_mask)[0]
+
+            # For events at this duration, count pairs with observations at LONGER durations
+            # (those already in the BIT)
+            for i in dur_indices:
+                if events_sorted[i] == 1:
+                    rank_i = risk_ranks[i]
+
+                    # Concordant: observations with lower risk already seen
+                    n_lower = bit_query(rank_i - 1) if rank_i > 0 else 0
+
+                    # Same risk (ties)
+                    n_same = bit_query(rank_i) - n_lower
+
+                    # Discordant: observations with higher risk already seen
+                    n_higher = (bit_query(n_unique_risks - 1) - bit_query(rank_i))
+
+                    concordant += n_lower
+                    tied_risk += n_same
+                    discordant += n_higher
+
+            # Add ALL observations at this duration to the BIT AFTER processing events
+            for i in dur_indices:
+                bit_update(risk_ranks[i])
+
+        total_pairs = concordant + discordant + tied_risk
+
         if total_pairs == 0:
             return 0.5
-        
-        c_index = (concordant + 0.5 * ties) / total_pairs
-        return c_index
+
+        c_index = (concordant + 0.5 * tied_risk) / total_pairs
+        return float(c_index)
     
     def _create_result_object(self, converged: bool, iterations: int) -> CoxPHResult:
         """Create a CoxPHResult object with all fitted values."""
