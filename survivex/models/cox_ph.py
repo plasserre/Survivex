@@ -687,6 +687,11 @@ class CoxPHModel:
             event_times = durations[event_mask]
             unique_times, inverse_indices = torch.unique(event_times, return_inverse=True)
 
+            # For Efron, we need weighted_XX (can't skip even if only computing likelihood)
+            if weighted_XX_cumsum_rev is None:
+                weighted_XX = X.unsqueeze(2) * X.unsqueeze(1) * risk_scores.unsqueeze(1).unsqueeze(2)
+                weighted_XX_cumsum_rev = torch.flip(torch.cumsum(torch.flip(weighted_XX, [0]), dim=0), [0])
+
             log_likelihood = torch.tensor(0.0, device=self.device, dtype=torch.float64)
             gradient = torch.zeros(n_features, device=self.device, dtype=torch.float64)
             hessian = torch.zeros((n_features, n_features), device=self.device, dtype=torch.float64)
