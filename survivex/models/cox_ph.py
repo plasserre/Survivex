@@ -251,23 +251,27 @@ class CoxPHModel:
         self.alpha = alpha
         self.max_iter = max_iter
         self.tol = tol
-        
+
         # Device selection
-        # Note: Cox model requires float64 for numerical stability
-        # MPS doesn't support float64, so we force CPU in that case
+        # Note: Cox PH is FASTER on CPU due to:
+        # 1. Sequential operations (cumulative sums, Newton-Raphson iterations)
+        # 2. GPU data transfer overhead
+        # 3. Highly optimized numpy/numba on CPU
+        # Default to CPU unless explicitly requested otherwise
         if device is None:
-            if torch.cuda.is_available():
-                device = 'cuda'
-            else:
-                # Use CPU even if MPS available (MPS doesn't support float64)
-                device = 'cpu'
+            device = 'cpu'  # CPU is faster for Cox PH
         elif device == 'mps':
             warnings.warn(
                 "MPS device does not support float64 required for Cox model. "
                 "Using CPU instead for numerical stability."
             )
             device = 'cpu'
-        
+        elif device == 'cuda':
+            warnings.warn(
+                "Cox PH is typically faster on CPU due to sequential operations. "
+                "Consider using device='cpu' for better performance."
+            )
+
         self.device = torch.device(device)
         
         # Model parameters (set after fitting)
