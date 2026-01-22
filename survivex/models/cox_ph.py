@@ -358,29 +358,30 @@ class CoxPHModel:
         
         # Initialize coefficients to zero
         beta = torch.zeros(n_features, device=self.device, dtype=torch.float64)
-        
+
         # Newton-Raphson optimization
         converged = False
         log_likelihood_history = []
-        
+
         for iteration in range(self.max_iter):
             # Compute log-likelihood, gradient, and Hessian
             log_lik, gradient, hessian = self._compute_derivatives(
                 beta, X_sorted, durations_sorted, events_sorted, start_times_sorted
             )
-            
+
             log_likelihood_history.append(log_lik.item())
-            
-            # Check convergence
-            gradient_norm = torch.norm(gradient)
-            if gradient_norm < self.tol:
-                converged = True
-                break
-            
+
             # Newton-Raphson step with line search
             try:
                 # Compute Newton direction
                 delta = torch.linalg.solve(hessian, gradient)
+
+                # Check convergence based on delta norm (like lifelines)
+                # This is more robust than gradient norm for large datasets
+                delta_norm = torch.norm(delta)
+                if delta_norm < self.tol:
+                    converged = True
+                    break
 
                 # Line search to ensure likelihood increases
                 # Use compute_hessian=False for line search (only need log-likelihood)
@@ -391,8 +392,10 @@ class CoxPHModel:
                     compute_hessian=False
                 )
 
-                # Backtracking line search
-                while log_lik_new < log_lik and step_size > 1e-8:
+                # Backtracking line search with relative tolerance
+                # Use relative comparison to handle floating point precision at optimum
+                improvement_threshold = max(abs(log_lik.item()) * 1e-12, 1e-12)
+                while log_lik_new < log_lik - improvement_threshold and step_size > 1e-8:
                     step_size *= 0.5
                     beta_new = beta - step_size * delta
                     log_lik_new, _, _ = self._compute_derivatives(
@@ -401,14 +404,14 @@ class CoxPHModel:
                     )
 
                 beta = beta_new
-                
+
             except RuntimeError:
                 # Hessian is singular, add regularization
                 warnings.warn("Hessian is singular, adding regularization")
                 regularization = torch.eye(n_features, device=self.device) * 1e-6
                 delta = torch.linalg.solve(hessian + regularization, gradient)
                 beta = beta - delta
-        
+
         if not converged:
             warnings.warn(f"Optimization did not converge in {self.max_iter} iterations")
         
@@ -464,15 +467,20 @@ class CoxPHModel:
         Compute log partial likelihood, gradient, and Hessian using vectorized operations.
 
         Uses reverse cumulative sums for efficient O(n) computation instead of O(n²) loops.
-        For CPU, uses optimized numpy; for GPU, uses torch.
+
+        IMPORTANT: Always uses numpy/Numba for Efron method regardless of device.
+        The Efron method requires a loop over unique event times, which creates massive
+        GPU overhead. CPU with Numba JIT is much faster for this loop-heavy computation.
+        GPU is only beneficial for Breslow (fully vectorized).
 
         Parameters:
         -----------
         compute_hessian : bool
             If False, skip Hessian computation (faster for line search).
         """
-        # Use numpy-based implementation for CPU (much faster due to no torch overhead in loops)
-        if self.device.type == 'cpu':
+        # Always use numpy/Numba for Efron - GPU overhead for loops is prohibitive
+        # Only use GPU for Breslow which is fully vectorized
+        if self.device.type == 'cpu' or self.tie_method == 'efron':
             return self._compute_derivatives_numpy(beta, X, durations, events, start_times, compute_hessian)
         else:
             return self._compute_derivatives_torch(beta, X, durations, events, start_times, compute_hessian)
