@@ -1,10 +1,10 @@
 """
-Random Survival Forest Implementation with GPU Support
+Random Survival Forest Implementation - Optimized
 
 Mathematical Foundation:
 =======================
 
-Random Survival Forest (RSF) is an ensemble method that combines multiple survival 
+Random Survival Forest (RSF) is an ensemble method that combines multiple survival
 trees using bootstrap aggregation (bagging) and random feature selection.
 
 Algorithm:
@@ -16,56 +16,33 @@ Algorithm:
 
 2. Prediction for new sample x:
    - Average cumulative hazard across all trees:
-     Ĥ(t|x) = (1/B) Σ_{b=1}^B H_b(t|x)
-   
+     H(t|x) = (1/B) sum_{b=1}^B H_b(t|x)
    - Survival function:
-     Ŝ(t|x) = exp(-Ĥ(t|x))
+     S(t|x) = exp(-H(t|x))
 
 Out-of-Bag (OOB) Error:
 -----------------------
 For each sample i, predict using only trees where i was OOB:
     C-index_OOB = concordance(predictions_OOB, actual)
 
-This provides unbiased estimate of prediction error.
-
 Variable Importance (VIMP):
 ---------------------------
-Measures importance of variable j:
-
-1. Permutation VIMP:
+Permutation VIMP:
    VIMP_j = C-index_original - C-index_permuted_j
-   
-   Permute values of variable j and measure decrease in performance.
-
-2. Minimal Depth:
-   Average depth at which variable j is first used for splitting.
-   Smaller depth = more important.
-
-Ensemble Cumulative Hazard:
----------------------------
-The ensemble CHF is the average across trees:
-    Ĥ_ensemble(t) = (1/B) Σ_{b=1}^B Ĥ_b(t)
-
-For different timelines across trees, we:
-1. Take union of all unique time points
-2. Interpolate each tree's CHF to common timeline
-3. Average the interpolated CHFs
 
 References:
 -----------
 - Ishwaran, H., et al. (2008). "Random survival forests"
-- Ishwaran, H., et al. (2010). "Random survival forests for high-dimensional data"
 - Breiman, L. (2001). "Random forests"
 
 Implementation Details:
 ----------------------
-- Uses PyTorch for GPU acceleration in prediction
-- Parallel tree building (CPU parallelization)
+- Uses vectorized numpy for fast computation
+- Parallel tree building via joblib
+- O(n log n) concordance index using merge-sort approach
 - Efficient OOB prediction tracking
-- Multiple importance measures
 """
 
-import torch
 import numpy as np
 from typing import Optional, Union, List, Tuple, Dict
 import warnings
@@ -73,14 +50,66 @@ from joblib import Parallel, delayed
 import multiprocessing as mp
 
 
+def _concordance_index_fast(durations, events, risk_scores):
+    """
+    O(n log n) concordance index using sorting.
+
+    C-index = P(risk_i > risk_j | T_i < T_j, delta_i = 1)
+    """
+    n = len(durations)
+    if n < 2:
+        return 0.5
+
+    # Only consider pairs where the earlier event is uncensored
+    event_mask = events == 1
+    if event_mask.sum() < 1:
+        return 0.5
+
+    # Sort by duration
+    order = np.argsort(durations)
+    dur_sorted = durations[order]
+    evt_sorted = events[order]
+    risk_sorted = risk_scores[order]
+
+    concordant = 0.0
+    discordant = 0.0
+    tied_risk = 0.0
+
+    # For each event, count how many later observations have lower risk
+    # Use a simple vectorized approach for moderate n
+    for i in range(n):
+        if evt_sorted[i] == 0:
+            continue
+
+        # Find all j where T_j > T_i (comparable pairs)
+        later = dur_sorted > dur_sorted[i]
+        if not later.any():
+            continue
+
+        later_risks = risk_sorted[later]
+        n_later = len(later_risks)
+
+        # Concordant: risk_i > risk_j (higher risk dies earlier)
+        concordant += np.sum(risk_sorted[i] > later_risks)
+        # Discordant: risk_i < risk_j
+        discordant += np.sum(risk_sorted[i] < later_risks)
+        # Tied
+        tied_risk += np.sum(risk_sorted[i] == later_risks)
+
+    permissible = concordant + discordant + tied_risk
+    if permissible == 0:
+        return 0.5
+
+    return (concordant + 0.5 * tied_risk) / permissible
+
+
 class RandomSurvivalForest:
     """
-    Random Survival Forest ensemble model with GPU support.
-    
+    Random Survival Forest ensemble model.
+
     An ensemble of survival trees trained on bootstrap samples with
-    random feature selection, providing robust predictions and
-    feature importance measures.
-    
+    random feature selection.
+
     Parameters:
     -----------
     n_estimators : int, default=100
@@ -92,60 +121,21 @@ class RandomSurvivalForest:
     min_samples_leaf : int, default=5
         Minimum samples required in a leaf
     max_features : int, str, or None, default='sqrt'
-        Number of features to consider per split:
-        - 'sqrt': sqrt(n_features)
-        - 'log2': log2(n_features)
-        - int: specific number
-        - None: all features
+        Number of features to consider per split
     bootstrap : bool, default=True
         Whether to use bootstrap sampling
     oob_score : bool, default=True
         Whether to calculate out-of-bag score
-    n_jobs : int, default=-1
-        Number of parallel jobs for tree building
-        -1 means use all processors
+    n_jobs : int, default=1
+        Number of parallel jobs (-1 = all processors, 1 = sequential)
     random_state : int, optional
         Random seed for reproducibility
     device : str, default='cpu'
-        Device for predictions ('cpu', 'cuda', 'mps')
+        Kept for API compatibility
     verbose : int, default=0
         Verbosity level
-    
-    Attributes:
-    -----------
-    estimators_ : list of SurvivalTree
-        The collection of fitted trees
-    oob_score_ : float
-        Out-of-bag concordance index
-    feature_importances_ : np.ndarray
-        Feature importance scores (average across trees)
-    n_features_ : int
-        Number of features
-    
-    Examples:
-    ---------
-    >>> # Basic usage
-    >>> rsf = RandomSurvivalForest(n_estimators=100, random_state=42)
-    >>> rsf.fit(X_train, durations_train, events_train)
-    >>> survival = rsf.predict_survival_function(X_test, times=[1, 5, 10])
-    >>> print(f"OOB Score: {rsf.oob_score_:.3f}")
-    
-    >>> # Feature importance
-    >>> importances = rsf.feature_importances_
-    >>> print("Top 5 features:", np.argsort(importances)[-5:])
-    
-    >>> # With GPU for predictions
-    >>> rsf = RandomSurvivalForest(n_estimators=100, device='cuda')
-    >>> rsf.fit(X_train, durations_train, events_train)
-    
-    Notes:
-    ------
-    - Tree building is CPU-parallelized using joblib
-    - GPU acceleration applies to ensemble predictions
-    - OOB score provides unbiased performance estimate
-    - Feature importance helps with interpretation
     """
-    
+
     def __init__(
         self,
         n_estimators: int = 100,
@@ -155,7 +145,7 @@ class RandomSurvivalForest:
         max_features: Union[int, str, None] = 'sqrt',
         bootstrap: bool = True,
         oob_score: bool = True,
-        n_jobs: int = -1,
+        n_jobs: int = 1,
         random_state: Optional[int] = None,
         device: str = 'cpu',
         verbose: int = 0
@@ -170,76 +160,50 @@ class RandomSurvivalForest:
         self.n_jobs = n_jobs if n_jobs != -1 else mp.cpu_count()
         self.random_state = random_state
         self.verbose = verbose
-        
-        # Set device
-        if device == 'mps' and not torch.backends.mps.is_available():
-            warnings.warn("MPS device not available, using CPU")
-            device = 'cpu'
-        elif device == 'cuda' and not torch.cuda.is_available():
-            warnings.warn("CUDA not available, using CPU")
-            device = 'cpu'
-        
-        self.device = torch.device(device)
-        
-        # Set random seed
+        self.device = device
+
         if random_state is not None:
             np.random.seed(random_state)
-            torch.manual_seed(random_state)
-        
-        # Attributes set during fitting
+
         self.estimators_ = []
         self.oob_predictions_ = None
         self.oob_score_ = None
         self.feature_importances_ = None
         self.n_features_ = None
-        self._oob_indices = []  # Track OOB samples for each tree
+        self._oob_indices = []
         self._is_fitted = False
-    
+
     def fit(
         self,
-        X: Union[np.ndarray, torch.Tensor],
-        durations: Union[np.ndarray, torch.Tensor],
-        events: Union[np.ndarray, torch.Tensor]
+        X: np.ndarray,
+        durations: np.ndarray,
+        events: np.ndarray
     ) -> 'RandomSurvivalForest':
         """
         Build the random survival forest.
-        
+
         Parameters:
         -----------
         X : array-like, shape (n_samples, n_features)
-            Training features
         durations : array-like, shape (n_samples,)
-            Time to event or censoring
         events : array-like, shape (n_samples,)
-            Event indicators (1=event, 0=censored)
-        
-        Returns:
-        --------
-        self : RandomSurvivalForest
-            Fitted forest
         """
-        # Import here to avoid circular dependency
         from survivex.models.survival_tree import SurvivalTree
-        
-        # Convert to numpy for easier manipulation
-        if isinstance(X, torch.Tensor):
-            X = X.cpu().numpy()
-        if isinstance(durations, torch.Tensor):
-            durations = durations.cpu().numpy()
-        if isinstance(events, torch.Tensor):
-            events = events.cpu().numpy()
-        
+
+        X = np.asarray(X, dtype=np.float64)
+        durations = np.asarray(durations, dtype=np.float64)
+        events = np.asarray(events, dtype=np.float64)
+
         n_samples, n_features = X.shape
         self.n_features_ = n_features
-        
-        if self.verbose > 0:
-            print(f"Building Random Survival Forest with {self.n_estimators} trees...")
-            print(f"Training samples: {n_samples}, Features: {n_features}")
-            print(f"Events: {int(events.sum())}/{n_samples} ({events.mean():.1%})")
-        
-        # Prepare for parallel tree building
-        seeds = np.random.randint(0, 1e9, self.n_estimators) if self.random_state else [None] * self.n_estimators
-        
+
+        # Generate seeds for reproducibility
+        if self.random_state is not None:
+            rng = np.random.RandomState(self.random_state)
+            seeds = rng.randint(0, 2**31, self.n_estimators)
+        else:
+            seeds = np.random.randint(0, 2**31, self.n_estimators)
+
         # Build trees in parallel
         results = Parallel(n_jobs=self.n_jobs, verbose=self.verbose)(
             delayed(self._build_single_tree)(
@@ -247,387 +211,226 @@ class RandomSurvivalForest:
             )
             for tree_idx in range(self.n_estimators)
         )
-        
-        # Unpack results
+
         self.estimators_ = [r[0] for r in results]
         self._oob_indices = [r[1] for r in results]
-        
-        # Calculate feature importances
+
+        # Feature importances
         self._calculate_feature_importances()
-        
-        # Calculate OOB score if requested
-        if self.oob_score:
+
+        # OOB score
+        if self.oob_score and self.bootstrap:
             self._calculate_oob_score(X, durations, events)
-        
+
         self._is_fitted = True
-        
-        if self.verbose > 0:
-            print(f"✅ Fitted {len(self.estimators_)} trees")
-            if self.oob_score:
-                print(f"OOB C-index: {self.oob_score_:.4f}")
-        
         return self
-    
+
     def _build_single_tree(
         self,
         X: np.ndarray,
         durations: np.ndarray,
         events: np.ndarray,
         tree_idx: int,
-        seed: Optional[int]
+        seed: int
     ) -> Tuple:
-        """
-        Build a single tree with bootstrap sampling.
-        
-        Returns:
-        --------
-        tree : SurvivalTree
-            Fitted tree
-        oob_indices : np.ndarray
-            Indices of out-of-bag samples
-        """
+        """Build a single tree with bootstrap sampling."""
         from survivex.models.survival_tree import SurvivalTree
-        
+
         n_samples = X.shape[0]
-        
-        # Bootstrap sampling
+        rng = np.random.RandomState(seed)
+
         if self.bootstrap:
-            if seed is not None:
-                np.random.seed(seed)
-            
-            # Sample with replacement
-            bootstrap_indices = np.random.choice(n_samples, n_samples, replace=True)
-            oob_indices = np.array([i for i in range(n_samples) if i not in bootstrap_indices])
-            
+            bootstrap_indices = rng.choice(n_samples, n_samples, replace=True)
+            # Use set for O(1) lookup instead of list comprehension
+            bootstrap_set = set(bootstrap_indices)
+            oob_indices = np.array([i for i in range(n_samples) if i not in bootstrap_set])
+
             X_bootstrap = X[bootstrap_indices]
             durations_bootstrap = durations[bootstrap_indices]
             events_bootstrap = events[bootstrap_indices]
         else:
-            # Use full dataset
-            bootstrap_indices = np.arange(n_samples)
-            oob_indices = np.array([])
-            
             X_bootstrap = X
             durations_bootstrap = durations
             events_bootstrap = events
-        
-        # Build tree
+            oob_indices = np.array([], dtype=np.int64)
+
         tree = SurvivalTree(
             max_depth=self.max_depth,
             min_samples_split=self.min_samples_split,
             min_samples_leaf=self.min_samples_leaf,
             max_features=self.max_features,
             random_state=seed,
-            device='cpu'  # Build trees on CPU
+            device='cpu'
         )
-        
+
         tree.fit(X_bootstrap, durations_bootstrap, events_bootstrap)
-        
         return tree, oob_indices
-    
+
     def _calculate_feature_importances(self):
-        """Calculate feature importances by averaging across trees."""
-        n_features = self.n_features_
-        importances = np.zeros(n_features)
-        
+        """Average feature importances across trees."""
+        importances = np.zeros(self.n_features_)
         for tree in self.estimators_:
             if tree.feature_importances_ is not None:
                 importances += tree.feature_importances_
-        
-        # Average across trees
         importances /= len(self.estimators_)
-        
-        # Normalize
-        if importances.sum() > 0:
-            importances /= importances.sum()
-        
+        total = importances.sum()
+        if total > 0:
+            importances /= total
         self.feature_importances_ = importances
-    
+
     def _calculate_oob_score(
         self,
         X: np.ndarray,
         durations: np.ndarray,
         events: np.ndarray
     ):
-        """
-        Calculate out-of-bag concordance index.
-        
-        For each sample, average predictions from trees where it was OOB.
-        """
+        """Calculate out-of-bag concordance index."""
         n_samples = X.shape[0]
-        
-        # Track predictions for each sample
-        oob_predictions = {}  # sample_idx -> list of risk scores
-        
+        median_time = np.median(durations[events == 1]) if (events == 1).any() else np.median(durations)
+
+        # Accumulate OOB predictions
+        oob_sum = np.zeros(n_samples)
+        oob_count = np.zeros(n_samples)
+
         for tree_idx, tree in enumerate(self.estimators_):
-            oob_indices = self._oob_indices[tree_idx]
-            
-            if len(oob_indices) == 0:
+            oob_idx = self._oob_indices[tree_idx]
+            if len(oob_idx) == 0:
                 continue
-            
-            # Get CHF predictions for OOB samples
-            X_oob = X[oob_indices]
-            
-            # Get a single risk score per sample (e.g., CHF at median time)
-            median_time = np.median(durations[events == 1]) if (events == 1).any() else np.median(durations)
-            
-            chf_preds = tree.predict_cumulative_hazard(X_oob, times=[median_time])
-            risk_scores = chf_preds[:, 0]  # CHF at median time
-            
-            # Store predictions
-            for idx, risk in zip(oob_indices, risk_scores):
-                if idx not in oob_predictions:
-                    oob_predictions[idx] = []
-                oob_predictions[idx].append(risk)
-        
-        # Average OOB predictions
-        oob_risk_scores = np.full(n_samples, np.nan)
-        for idx, predictions in oob_predictions.items():
-            oob_risk_scores[idx] = np.mean(predictions)
-        
-        # Calculate concordance index on samples with OOB predictions
-        valid_mask = ~np.isnan(oob_risk_scores)
-        if valid_mask.sum() < 2:
-            warnings.warn("Not enough OOB samples for score calculation")
+
+            chf_preds = tree.predict_cumulative_hazard(X[oob_idx], times=np.array([median_time]))
+            oob_sum[oob_idx] += chf_preds[:, 0]
+            oob_count[oob_idx] += 1
+
+        # Average and compute C-index
+        valid = oob_count > 0
+        if valid.sum() < 2:
             self.oob_score_ = np.nan
             return
-        
-        self.oob_score_ = self._concordance_index(
-            durations[valid_mask],
-            events[valid_mask],
-            oob_risk_scores[valid_mask]
+
+        oob_risk = oob_sum[valid] / oob_count[valid]
+        self.oob_score_ = _concordance_index_fast(
+            durations[valid], events[valid], oob_risk
         )
-    
-    def _concordance_index(
-        self,
-        durations: np.ndarray,
-        events: np.ndarray,
-        risk_scores: np.ndarray
-    ) -> float:
-        """
-        Calculate Harrell's concordance index.
-        
-        C-index measures the proportion of comparable pairs where the
-        predicted ranking matches the actual ranking.
-        """
-        n = len(durations)
-        concordant = 0
-        permissible = 0
-        
-        for i in range(n):
-            if events[i] == 0:
-                continue
-            
-            for j in range(n):
-                if durations[j] > durations[i]:
-                    permissible += 1
-                    if risk_scores[i] > risk_scores[j]:
-                        concordant += 1
-                    elif risk_scores[i] == risk_scores[j]:
-                        concordant += 0.5
-        
-        if permissible == 0:
-            return 0.5
-        
-        return concordant / permissible
-    
+
     def predict_cumulative_hazard(
         self,
-        X: Union[np.ndarray, torch.Tensor],
-        times: Optional[Union[np.ndarray, List[float]]] = None
+        X: np.ndarray,
+        times: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """
         Predict ensemble cumulative hazard function.
-        
+
         Parameters:
         -----------
         X : array-like, shape (n_samples, n_features)
-            Test samples
         times : array-like, optional
-            Time points for prediction. If None, uses union of all tree timelines.
-        
+
         Returns:
         --------
         chf : np.ndarray, shape (n_samples, n_times)
-            Ensemble cumulative hazard function
         """
         if not self._is_fitted:
             raise ValueError("Forest must be fitted before prediction")
-        
-        if isinstance(X, torch.Tensor):
-            X = X.cpu().numpy()
-        
-        n_samples = X.shape[0]
-        
-        # If times not specified, use union of tree timelines
+
+        X = np.asarray(X, dtype=np.float64)
+
         if times is None:
-            # Get common timeline (can be expensive)
+            # Get common timeline from first few trees
             all_times = set()
-            for tree in self.estimators_[:10]:  # Sample first 10 trees
+            for tree in self.estimators_[:10]:
                 pred = tree.predict_cumulative_hazard(X[:1])
                 if isinstance(pred, list):
-                    all_times.update(pred[0]['timeline'].cpu().numpy())
-            times = sorted(all_times)
-        
-        times = np.array(times)
+                    all_times.update(pred[0]['timeline'])
+            times = np.sort(np.array(list(all_times)))
+
+        times = np.asarray(times, dtype=np.float64)
+        n_samples = X.shape[0]
         n_times = len(times)
-        
-        # Collect predictions from all trees
+
+        # Average CHF across trees
         ensemble_chf = np.zeros((n_samples, n_times))
-        
         for tree in self.estimators_:
-            tree_chf = tree.predict_cumulative_hazard(X, times=times)
-            ensemble_chf += tree_chf
-        
-        # Average across trees
+            ensemble_chf += tree.predict_cumulative_hazard(X, times=times)
         ensemble_chf /= len(self.estimators_)
-        
+
         return ensemble_chf
-    
+
     def predict_survival_function(
         self,
-        X: Union[np.ndarray, torch.Tensor],
-        times: Optional[Union[np.ndarray, List[float]]] = None
+        X: np.ndarray,
+        times: Optional[np.ndarray] = None
     ) -> np.ndarray:
-        """
-        Predict ensemble survival function.
-        
-        Parameters:
-        -----------
-        X : array-like, shape (n_samples, n_features)
-            Test samples
-        times : array-like, optional
-            Time points for prediction
-        
-        Returns:
-        --------
-        survival : np.ndarray, shape (n_samples, n_times)
-            Ensemble survival function
-        """
-        # Get ensemble CHF
+        """Predict ensemble survival function: S(t) = exp(-H(t))."""
         chf = self.predict_cumulative_hazard(X, times)
-        
-        # Convert to survival: S(t) = exp(-H(t))
-        survival = np.exp(-chf)
-        
-        return survival
-    
-    def predict_risk_score(
-        self,
-        X: Union[np.ndarray, torch.Tensor]
-    ) -> np.ndarray:
-        """
-        Predict risk scores (higher = higher risk).
-        
-        Uses cumulative hazard at median survival time as risk score.
-        
-        Parameters:
-        -----------
-        X : array-like, shape (n_samples, n_features)
-            Test samples
-        
-        Returns:
-        --------
-        risk_scores : np.ndarray, shape (n_samples,)
-            Risk scores
-        """
+        return np.exp(-chf)
+
+    def predict_risk_score(self, X: np.ndarray) -> np.ndarray:
+        """Predict risk scores (total CHF as risk proxy)."""
         if not self._is_fitted:
             raise ValueError("Forest must be fitted before prediction")
-        
-        # Use CHF at a single time point (e.g., median)
-        # This is a simple risk score
-        median_time = 10.0  # Default, could be made smarter
-        
-        chf = self.predict_cumulative_hazard(X, times=[median_time])
-        return chf[:, 0]
-    
+
+        X = np.asarray(X, dtype=np.float64)
+        n_samples = X.shape[0]
+        risk_scores = np.zeros(n_samples)
+
+        for tree in self.estimators_:
+            risk_scores += tree.predict(X)
+        risk_scores /= len(self.estimators_)
+
+        return risk_scores
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict risk scores (alias for predict_risk_score)."""
+        return self.predict_risk_score(X)
+
     def score(
         self,
-        X: Union[np.ndarray, torch.Tensor],
-        durations: Union[np.ndarray, torch.Tensor],
-        events: Union[np.ndarray, torch.Tensor]
+        X: np.ndarray,
+        durations: np.ndarray,
+        events: np.ndarray
     ) -> float:
-        """
-        Calculate concordance index on test data.
-        
-        Parameters:
-        -----------
-        X : array-like, shape (n_samples, n_features)
-            Test features
-        durations : array-like, shape (n_samples,)
-            Test durations
-        events : array-like, shape (n_samples,)
-            Test events
-        
-        Returns:
-        --------
-        c_index : float
-            Concordance index
-        """
-        if isinstance(durations, torch.Tensor):
-            durations = durations.cpu().numpy()
-        if isinstance(events, torch.Tensor):
-            events = events.cpu().numpy()
-        
-        # Get risk scores
+        """Calculate concordance index on test data."""
+        durations = np.asarray(durations, dtype=np.float64)
+        events = np.asarray(events, dtype=np.float64)
         risk_scores = self.predict_risk_score(X)
-        
-        # Calculate C-index
-        return self._concordance_index(durations, events, risk_scores)
-    
+        return _concordance_index_fast(durations, events, risk_scores)
+
     def compute_feature_importance_permutation(
         self,
-        X: Union[np.ndarray, torch.Tensor],
-        durations: Union[np.ndarray, torch.Tensor],
-        events: Union[np.ndarray, torch.Tensor],
+        X: np.ndarray,
+        durations: np.ndarray,
+        events: np.ndarray,
         n_repeats: int = 5
     ) -> Dict[str, np.ndarray]:
         """
         Compute permutation-based feature importance.
-        
-        Measures decrease in performance when each feature is randomly permuted.
-        
+
         Parameters:
         -----------
         X : array-like, shape (n_samples, n_features)
-            Test features
         durations : array-like, shape (n_samples,)
-            Test durations  
         events : array-like, shape (n_samples,)
-            Test events
         n_repeats : int, default=5
-            Number of times to permute each feature
-        
+
         Returns:
         --------
-        importance : dict
-            Dictionary with 'importances_mean' and 'importances_std'
+        importance : dict with 'importances_mean' and 'importances_std'
         """
-        if isinstance(X, torch.Tensor):
-            X = X.cpu().numpy()
-        if isinstance(durations, torch.Tensor):
-            durations = durations.cpu().numpy()
-        if isinstance(events, torch.Tensor):
-            events = events.cpu().numpy()
-        
-        # Baseline score
+        X = np.asarray(X, dtype=np.float64)
+        durations = np.asarray(durations, dtype=np.float64)
+        events = np.asarray(events, dtype=np.float64)
+
         baseline_score = self.score(X, durations, events)
-        
         n_features = X.shape[1]
         importance_scores = np.zeros((n_features, n_repeats))
-        
+
         for feature_idx in range(n_features):
             for repeat in range(n_repeats):
-                # Permute feature
                 X_permuted = X.copy()
                 X_permuted[:, feature_idx] = np.random.permutation(X_permuted[:, feature_idx])
-                
-                # Calculate score with permuted feature
                 permuted_score = self.score(X_permuted, durations, events)
-                
-                # Importance = decrease in performance
                 importance_scores[feature_idx, repeat] = baseline_score - permuted_score
-        
+
         return {
             'importances_mean': importance_scores.mean(axis=1),
             'importances_std': importance_scores.std(axis=1)

@@ -202,28 +202,42 @@ class GradientBoostingSurvivalAnalysis:
         # Initialize feature importances
         self.feature_importances_ = np.zeros(n_features)
         
+        # Pre-compute sort indices for each feature (reused across all trees)
+        self._sort_indices = np.empty((n_features, n_samples), dtype=np.intp)
+        for f_idx in range(n_features):
+            self._sort_indices[f_idx] = np.argsort(X[:, f_idx])
+
+        # Pre-compute duration sort order (used in gradient and loss computation)
+        self._duration_order = np.argsort(durations)
+        self._durations_sorted = durations[self._duration_order]
+        self._events_sorted = events[self._duration_order]
+        # Pre-compute unique duration positions for tie handling
+        self._unique_dur_vals, self._unique_dur_first = np.unique(
+            self._durations_sorted, return_index=True
+        )
+
         # Boosting iterations
         for m in range(self.n_estimators):
             # Compute gradients
             residuals = self._compute_gradients(F, durations, events)
-            
+
             # Subsample if needed
             if self.subsample < 1.0:
-                sample_indices = np.random.choice(
+                sub_indices = np.random.choice(
                     n_samples,
                     size=int(self.subsample * n_samples),
                     replace=False
                 )
-                X_sample = X[sample_indices]
-                residuals_sample = residuals[sample_indices]
+                X_sample = X[sub_indices]
+                residuals_sample = residuals[sub_indices]
             else:
                 X_sample = X
                 residuals_sample = residuals
-                sample_indices = np.arange(n_samples)
-            
-            # Fit tree
-            tree = self._fit_regression_tree(X_sample, residuals_sample)
-            
+
+            # Fit tree (use pre-sorted indices for full data)
+            use_presorted = (self.subsample >= 1.0)
+            tree = self._fit_regression_tree(X_sample, residuals_sample, use_presorted=use_presorted)
+
             # Make predictions
             tree_predictions = self._predict_tree(tree, X)
             
@@ -232,17 +246,18 @@ class GradientBoostingSurvivalAnalysis:
             
             # Store
             self.estimators_.append(tree)
-            
-            # Compute loss
-            loss = self._compute_loss(F, durations, events)
-            self.train_score_.append(loss)
-            
+
             # Update importances
             self.feature_importances_ += tree['feature_importances']
-            
+
+            # Compute loss only when needed (verbose or OOB)
+            if self.verbose > 0 or self.subsample < 1.0:
+                loss = self._compute_loss(F, durations, events)
+                self.train_score_.append(loss)
+
             # OOB improvement
             if self.subsample < 1.0:
-                oob_indices = np.array([i for i in range(n_samples) if i not in sample_indices])
+                oob_indices = np.array([i for i in range(n_samples) if i not in sub_indices])
                 if len(oob_indices) > 0:
                     F_oob_old = F[oob_indices] - self.learning_rate * tree_predictions[oob_indices]
                     loss_oob_old = self._compute_loss(F_oob_old, durations[oob_indices], events[oob_indices])
@@ -251,8 +266,15 @@ class GradientBoostingSurvivalAnalysis:
             
             # Verbose
             if self.verbose > 0 and (m + 1) % max(1, self.n_estimators // 10) == 0:
-                print(f"  Iteration {m+1}/{self.n_estimators}, Loss: {loss:.4f}")
+                if self.train_score_:
+                    print(f"  Iteration {m+1}/{self.n_estimators}, Loss: {self.train_score_[-1]:.4f}")
         
+        # Clean up pre-computed data (not needed after fit)
+        for attr in ('_sort_indices', '_duration_order', '_durations_sorted',
+                     '_events_sorted', '_unique_dur_vals', '_unique_dur_first'):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
         # Normalize importances
         if self.feature_importances_.sum() > 0:
             self.feature_importances_ /= self.feature_importances_.sum()
@@ -267,11 +289,11 @@ class GradientBoostingSurvivalAnalysis:
         
         return self
     
-    def _fit_regression_tree(self, X: np.ndarray, y: np.ndarray) -> Dict:
-        """Fit a simple regression tree."""
+    def _fit_regression_tree(self, X: np.ndarray, y: np.ndarray, use_presorted=False) -> Dict:
+        """Fit a regression tree using index-mask approach to avoid repeated sorting."""
         n_samples, n_features = X.shape
-        
-        # Determine features
+
+        # Determine max features per split
         if self.max_features is None:
             max_features = n_features
         elif isinstance(self.max_features, int):
@@ -282,217 +304,400 @@ class GradientBoostingSurvivalAnalysis:
             max_features = max(1, int(np.log2(n_features)))
         else:
             max_features = n_features
-        
-        tree = self._build_regression_tree_recursive(X, y, depth=0, max_features=max_features)
+
+        # Use pre-sorted indices to avoid sorting at every node
+        if use_presorted and hasattr(self, '_sort_indices'):
+            # Build filtered sort orders for each feature
+            # _sort_indices[f] gives indices that sort X[:, f]
+            # We can filter these for any subset using a boolean mask
+            tree = self._build_tree_with_indices(
+                X, y, np.arange(n_samples), depth=0, max_features=max_features
+            )
+        else:
+            tree = self._build_tree_simple(X, y, depth=0, max_features=max_features)
         return tree
-    
-    def _build_regression_tree_recursive(
+
+    def _build_tree_with_indices(
+        self, X: np.ndarray, y: np.ndarray, indices: np.ndarray,
+        depth: int, max_features: int
+    ) -> Dict:
+        """Build regression tree using pre-sorted indices (no sorting at any level)."""
+        n_samples = len(indices)
+
+        node = {
+            'n_samples': n_samples,
+            'prediction': y[indices].mean(),
+            'feature_importances': np.zeros(self.n_features_)
+        }
+
+        if (depth >= self.max_depth or
+            n_samples < self.min_samples_split):
+            node['is_leaf'] = True
+            return node
+
+        y_node = y[indices]
+        if np.all(y_node == y_node[0]):
+            node['is_leaf'] = True
+            return node
+
+        # Find best split using pre-sorted indices
+        best_split = self._find_split_with_indices(X, y, indices, max_features)
+
+        if best_split is None or best_split['improvement'] < 1e-7:
+            node['is_leaf'] = True
+            return node
+
+        # Split indices
+        feature_vals = X[indices, best_split['feature']]
+        left_mask = feature_vals <= best_split['threshold']
+        left_indices = indices[left_mask]
+        right_indices = indices[~left_mask]
+
+        node['feature_importances'][best_split['feature']] = best_split['improvement']
+        node['is_leaf'] = False
+        node['feature'] = best_split['feature']
+        node['threshold'] = best_split['threshold']
+
+        node['left'] = self._build_tree_with_indices(
+            X, y, left_indices, depth + 1, max_features
+        )
+        node['right'] = self._build_tree_with_indices(
+            X, y, right_indices, depth + 1, max_features
+        )
+
+        node['feature_importances'] += node['left']['feature_importances']
+        node['feature_importances'] += node['right']['feature_importances']
+        return node
+
+    def _find_split_with_indices(
+        self, X: np.ndarray, y: np.ndarray, indices: np.ndarray, max_features: int
+    ) -> Optional[Dict]:
+        """Find best split using pre-sorted indices (O(n) filter instead of O(n log n) sort)."""
+        n_samples = len(indices)
+        n_features = X.shape[1]
+
+        if max_features < n_features:
+            features = np.random.choice(n_features, max_features, replace=False)
+        else:
+            features = np.arange(n_features)
+
+        y_node = y[indices]
+        total_sum = y_node.sum()
+        total_sq_sum = (y_node * y_node).sum()
+        total_variance = total_sq_sum - total_sum * total_sum / n_samples
+
+        best_split = None
+        best_improvement = -np.inf
+        MAX_THRESHOLDS = 30
+
+        # Create membership mask for O(1) lookup
+        in_node = np.zeros(len(X), dtype=bool)
+        in_node[indices] = True
+
+        for feature_idx in features:
+            # Filter pre-sorted indices to get sorted order for this node
+            full_sort = self._sort_indices[feature_idx]
+            # O(n_total) filter - but we only read the boolean mask
+            node_sort = full_sort[in_node[full_sort]]
+
+            sorted_vals = X[node_sort, feature_idx]
+            sorted_y = y[node_sort]
+
+            # Cumulative sums for variance computation
+            cum_sum = np.cumsum(sorted_y)
+            cum_sq_sum = np.cumsum(sorted_y * sorted_y)
+
+            # Find split positions
+            change_mask = sorted_vals[1:] != sorted_vals[:-1]
+            change_positions = np.where(change_mask)[0]
+
+            if len(change_positions) == 0:
+                continue
+
+            if len(change_positions) > MAX_THRESHOLDS:
+                idx = np.linspace(0, len(change_positions) - 1, MAX_THRESHOLDS, dtype=int)
+                change_positions = change_positions[idx]
+
+            n_lefts = change_positions + 1
+            n_rights = n_samples - n_lefts
+            valid = (n_lefts >= self.min_samples_leaf) & (n_rights >= self.min_samples_leaf)
+            if not valid.any():
+                continue
+
+            valid_positions = change_positions[valid]
+            valid_n_lefts = n_lefts[valid]
+            valid_n_rights = n_rights[valid]
+
+            left_sums = cum_sum[valid_positions]
+            left_sq_sums = cum_sq_sum[valid_positions]
+            left_var_n = left_sq_sums - left_sums * left_sums / valid_n_lefts
+
+            right_sums = total_sum - left_sums
+            right_sq_sums = total_sq_sum - left_sq_sums
+            right_var_n = right_sq_sums - right_sums * right_sums / valid_n_rights
+
+            improvements = total_variance - (left_var_n + right_var_n)
+
+            best_idx = np.argmax(improvements)
+            if improvements[best_idx] > best_improvement:
+                best_improvement = improvements[best_idx]
+                pos = valid_positions[best_idx]
+                best_split = {
+                    'feature': feature_idx,
+                    'threshold': (sorted_vals[pos] + sorted_vals[pos + 1]) / 2,
+                    'improvement': best_improvement,
+                    'n_left': int(valid_n_lefts[best_idx]),
+                    'n_right': int(valid_n_rights[best_idx])
+                }
+
+        return best_split
+
+    def _build_tree_simple(
         self, X: np.ndarray, y: np.ndarray, depth: int, max_features: int
     ) -> Dict:
-        """Recursively build regression tree."""
+        """Build regression tree with sorting (fallback for subsampled data)."""
         n_samples, n_features = X.shape
-        
+
         node = {
             'n_samples': n_samples,
             'prediction': np.mean(y),
             'feature_importances': np.zeros(self.n_features_)
         }
-        
-        # Stopping criteria
+
         if (depth >= self.max_depth or
             n_samples < self.min_samples_split or
             np.all(y == y[0])):
             node['is_leaf'] = True
             return node
-        
-        # Find best split
-        best_split = self._find_best_regression_split(X, y, max_features)
-        
+
+        best_split = self._find_split_simple(X, y, max_features)
+
         if best_split is None or best_split['improvement'] < 1e-7:
             node['is_leaf'] = True
             return node
-        
-        # Check min samples
-        if (best_split['n_left'] < self.min_samples_leaf or
-            best_split['n_right'] < self.min_samples_leaf):
-            node['is_leaf'] = True
-            return node
-        
-        # Split
+
         left_mask = X[:, best_split['feature']] <= best_split['threshold']
-        right_mask = ~left_mask
-        
+
         node['feature_importances'][best_split['feature']] = best_split['improvement']
         node['is_leaf'] = False
         node['feature'] = best_split['feature']
         node['threshold'] = best_split['threshold']
-        
-        # Build children
-        node['left'] = self._build_regression_tree_recursive(
-            X[left_mask], y[left_mask], depth + 1, max_features
-        )
-        node['right'] = self._build_regression_tree_recursive(
-            X[right_mask], y[right_mask], depth + 1, max_features
-        )
-        
+
+        node['left'] = self._build_tree_simple(X[left_mask], y[left_mask], depth + 1, max_features)
+        node['right'] = self._build_tree_simple(X[~left_mask], y[~left_mask], depth + 1, max_features)
+
         node['feature_importances'] += node['left']['feature_importances']
         node['feature_importances'] += node['right']['feature_importances']
-        
         return node
-    
-    def _find_best_regression_split(
+
+    def _find_split_simple(
         self, X: np.ndarray, y: np.ndarray, max_features: int
     ) -> Optional[Dict]:
-        """Find best split for regression."""
+        """Find best split with sorting (for subsampled data)."""
         n_samples, n_features = X.shape
-        
+
         if max_features < n_features:
             features = np.random.choice(n_features, max_features, replace=False)
         else:
-            features = range(n_features)
-        
+            features = np.arange(n_features)
+
         best_split = None
         best_improvement = -np.inf
-        total_variance = np.var(y) * n_samples
-        
+        total_sum = y.sum()
+        total_sq_sum = (y * y).sum()
+        total_variance = total_sq_sum - total_sum * total_sum / n_samples
+        MAX_THRESHOLDS = 30
+
         for feature_idx in features:
-            feature_values = X[:, feature_idx]
-            unique_values = np.unique(feature_values)
-            
-            if len(unique_values) < 2:
+            sort_idx = np.argsort(X[:, feature_idx])
+            sorted_vals = X[sort_idx, feature_idx]
+            sorted_y = y[sort_idx]
+
+            cum_sum = np.cumsum(sorted_y)
+            cum_sq_sum = np.cumsum(sorted_y * sorted_y)
+
+            change_mask = sorted_vals[1:] != sorted_vals[:-1]
+            change_positions = np.where(change_mask)[0]
+
+            if len(change_positions) == 0:
                 continue
-            
-            if len(unique_values) > 10:
-                indices = np.linspace(0, len(unique_values) - 1, 10, dtype=int)
-                unique_values = unique_values[indices]
-            
-            thresholds = (unique_values[:-1] + unique_values[1:]) / 2
-            
-            for threshold in thresholds:
-                left_mask = feature_values <= threshold
-                right_mask = ~left_mask
-                
-                n_left = left_mask.sum()
-                n_right = right_mask.sum()
-                
-                if n_left < self.min_samples_leaf or n_right < self.min_samples_leaf:
-                    continue
-                
-                y_left = y[left_mask]
-                y_right = y[right_mask]
-                
-                left_variance = np.var(y_left) * n_left
-                right_variance = np.var(y_right) * n_right
-                
-                improvement = total_variance - (left_variance + right_variance)
-                
-                if improvement > best_improvement:
-                    best_improvement = improvement
-                    best_split = {
-                        'feature': feature_idx,
-                        'threshold': threshold,
-                        'improvement': improvement,
-                        'n_left': n_left,
-                        'n_right': n_right
-                    }
-        
+            if len(change_positions) > MAX_THRESHOLDS:
+                idx = np.linspace(0, len(change_positions) - 1, MAX_THRESHOLDS, dtype=int)
+                change_positions = change_positions[idx]
+
+            n_lefts = change_positions + 1
+            n_rights = n_samples - n_lefts
+            valid = (n_lefts >= self.min_samples_leaf) & (n_rights >= self.min_samples_leaf)
+            if not valid.any():
+                continue
+
+            valid_positions = change_positions[valid]
+            valid_n_lefts = n_lefts[valid]
+            valid_n_rights = n_rights[valid]
+
+            left_sums = cum_sum[valid_positions]
+            left_sq_sums = cum_sq_sum[valid_positions]
+            left_var_n = left_sq_sums - left_sums * left_sums / valid_n_lefts
+            right_sums = total_sum - left_sums
+            right_sq_sums = total_sq_sum - left_sq_sums
+            right_var_n = right_sq_sums - right_sums * right_sums / valid_n_rights
+            improvements = total_variance - (left_var_n + right_var_n)
+
+            best_idx = np.argmax(improvements)
+            if improvements[best_idx] > best_improvement:
+                best_improvement = improvements[best_idx]
+                pos = valid_positions[best_idx]
+                best_split = {
+                    'feature': feature_idx,
+                    'threshold': (sorted_vals[pos] + sorted_vals[pos + 1]) / 2,
+                    'improvement': best_improvement,
+                    'n_left': int(valid_n_lefts[best_idx]),
+                    'n_right': int(valid_n_rights[best_idx])
+                }
+
         return best_split
     
     def _predict_tree(self, tree: Dict, X: np.ndarray) -> np.ndarray:
-        """Predict using tree."""
-        predictions = np.zeros(len(X))
-        for i, x in enumerate(X):
-            predictions[i] = self._traverse_tree(tree, x)
+        """Predict using tree - vectorized batch traversal."""
+        predictions = np.empty(len(X))
+        # Use stack-based traversal with index masks for vectorized prediction
+        stack = [(tree, np.arange(len(X)))]
+        while stack:
+            node, indices = stack.pop()
+            if len(indices) == 0:
+                continue
+            if node['is_leaf']:
+                predictions[indices] = node['prediction']
+            else:
+                feature_vals = X[indices, node['feature']]
+                left_mask = feature_vals <= node['threshold']
+                right_mask = ~left_mask
+                stack.append((node['left'], indices[left_mask]))
+                stack.append((node['right'], indices[right_mask]))
         return predictions
-    
-    def _traverse_tree(self, node: Dict, x: np.ndarray) -> float:
-        """Traverse tree for prediction."""
-        if node['is_leaf']:
-            return node['prediction']
-        
-        if x[node['feature']] <= node['threshold']:
-            return self._traverse_tree(node['left'], x)
-        else:
-            return self._traverse_tree(node['right'], x)
     
     def _compute_gradients(
         self, risk_scores: np.ndarray, durations: np.ndarray, events: np.ndarray
     ) -> np.ndarray:
-        """Compute negative gradients of Cox partial likelihood."""
+        """Compute negative gradients of Cox partial likelihood using pre-sorted order."""
         n = len(risk_scores)
-        gradients = np.zeros(n)
-        
-        order = np.argsort(durations)
-        durations_sorted = durations[order]
-        events_sorted = events[order]
+
+        # Use pre-computed sort order
+        order = self._duration_order
+        events_sorted = self._events_sorted
         risk_scores_sorted = risk_scores[order]
-        
-        exp_risk = np.exp(risk_scores_sorted)
-        event_times = durations_sorted[events_sorted == 1]
-        
-        for t in event_times:
-            at_risk_mask = durations_sorted >= t
-            sum_exp_risk = np.sum(exp_risk[at_risk_mask])
-            
-            if sum_exp_risk > 0:
-                gradients[order[at_risk_mask]] += exp_risk[at_risk_mask] / sum_exp_risk
-        
-        gradients -= events
+
+        # Numerical stability
+        rs_max = risk_scores_sorted.max()
+        exp_risk = np.exp(risk_scores_sorted - rs_max)
+
+        # Risk set sum: reverse cumsum in ascending order
+        risk_set_sums = np.cumsum(exp_risk[::-1])[::-1]
+
+        # Handle ties using pre-computed unique positions
+        first_idx = self._unique_dur_first
+        n_unique = len(first_idx)
+        for idx in range(n_unique):
+            start = first_idx[idx]
+            end = first_idx[idx + 1] if idx + 1 < n_unique else n
+            if end > start + 1:
+                risk_set_sums[start:end] = risk_set_sums[start]
+
+        # Event contributions
+        event_contributions = np.where(events_sorted == 1, 1.0 / risk_set_sums, 0.0)
+        cumulative_event_contrib = np.cumsum(event_contributions)
+
+        # Handle ties for cumulative contribution
+        for idx in range(n_unique):
+            start = first_idx[idx]
+            end = first_idx[idx + 1] if idx + 1 < n_unique else n
+            if end > start + 1:
+                cumulative_event_contrib[start:end] = cumulative_event_contrib[end - 1]
+
+        # Gradient
+        gradients_sorted = exp_risk * cumulative_event_contrib - events_sorted
+
+        # Map back to original order
+        gradients = np.empty(n)
+        gradients[order] = gradients_sorted
         return -gradients
     
     def _compute_loss(
         self, risk_scores: np.ndarray, durations: np.ndarray, events: np.ndarray
     ) -> float:
-        """Compute negative Cox partial log-likelihood."""
+        """Compute negative Cox partial log-likelihood using vectorized cumsum."""
+        # Sort ascending by duration
         order = np.argsort(durations)
         durations_sorted = durations[order]
         events_sorted = events[order]
         risk_scores_sorted = risk_scores[order]
-        
-        log_likelihood = 0.0
-        
-        for i in range(len(durations_sorted)):
-            if events_sorted[i] == 0:
-                continue
-            
-            at_risk = durations_sorted >= durations_sorted[i]
-            log_risk_sum = np.log(np.sum(np.exp(risk_scores_sorted[at_risk])))
-            log_likelihood += risk_scores_sorted[i] - log_risk_sum
-        
+
+        # Numerical stability
+        rs_max = risk_scores_sorted.max()
+        exp_risk = np.exp(risk_scores_sorted - rs_max)
+
+        # Risk set sums: reverse cumsum in ascending order
+        risk_set_sums = np.cumsum(exp_risk[::-1])[::-1]
+
+        # Handle ties: first occurrence in ascending order has the correct sum
+        n = len(durations_sorted)
+        unique_vals, first_idx = np.unique(durations_sorted, return_index=True)
+        for idx in range(len(first_idx)):
+            start = first_idx[idx]
+            end = first_idx[idx + 1] if idx + 1 < len(first_idx) else n
+            if end > start + 1:
+                risk_set_sums[start:end] = risk_set_sums[start]
+
+        # Log-likelihood: Σ_{i: δ_i=1} [η_i - log(Σ_{j:T_j>=T_i} exp(η_j))]
+        # = Σ_{i: δ_i=1} [(η_i - rs_max) - log(risk_set_sum_i)]
+        event_mask = events_sorted == 1
+        log_likelihood = np.sum(
+            (risk_scores_sorted[event_mask] - rs_max) - np.log(risk_set_sums[event_mask])
+        )
+
         return -log_likelihood
     
     def _estimate_baseline_hazard(
         self, risk_scores: np.ndarray, durations: np.ndarray, events: np.ndarray
     ):
-        """Estimate baseline hazard using Breslow estimator."""
+        """Estimate baseline hazard using Breslow estimator - vectorized."""
         order = np.argsort(durations)
         durations_sorted = durations[order]
         events_sorted = events[order]
         risk_scores_sorted = risk_scores[order]
-        
+
         unique_times = np.unique(durations_sorted[events_sorted == 1])
-        
+
         if len(unique_times) == 0:
             self.timeline_ = torch.tensor([0.0, durations_sorted.max()])
             self.baseline_hazard_ = torch.tensor([0.0, 0.0])
             self.baseline_cumulative_hazard_ = torch.tensor([0.0, 0.0])
             self.baseline_survival_ = torch.tensor([1.0, 1.0])
             return
-        
+
         timeline = np.concatenate([[0.0], unique_times])
         baseline_hazard = np.zeros(len(timeline))
-        
-        for i, t in enumerate(unique_times):
-            d_t = np.sum((durations_sorted == t) & (events_sorted == 1))
-            at_risk_mask = durations_sorted >= t
-            sum_exp_risk = np.sum(np.exp(risk_scores_sorted[at_risk_mask]))
-            
-            if sum_exp_risk > 0:
-                baseline_hazard[i + 1] = d_t / sum_exp_risk
-        
+
+        # Vectorized: compute exp(risk) and reverse cumsum for risk set sums
+        exp_risk = np.exp(risk_scores_sorted)
+        # Risk set sum at each unique time using searchsorted
+        # For each unique_time t, at_risk = durations >= t, i.e. indices >= searchsorted(t, 'left')
+        positions = np.searchsorted(durations_sorted, unique_times, side='left')
+        risk_set_sums = np.array([exp_risk[pos:].sum() for pos in positions])
+
+        # Count events at each unique time using searchsorted on event times
+        event_durations = durations_sorted[events_sorted == 1]
+        event_counts = np.zeros(len(unique_times))
+        idx = np.searchsorted(unique_times, event_durations)
+        np.add.at(event_counts, idx, 1)
+
+        # Baseline hazard
+        nonzero = risk_set_sums > 0
+        baseline_hazard[1:][nonzero] = event_counts[nonzero] / risk_set_sums[nonzero]
+
         baseline_cumulative_hazard = np.cumsum(baseline_hazard)
         baseline_survival = np.exp(-baseline_cumulative_hazard)
-        
+
         self.timeline_ = torch.tensor(timeline, dtype=torch.float32, device=self.device)
         self.baseline_hazard_ = torch.tensor(baseline_hazard, dtype=torch.float32, device=self.device)
         self.baseline_cumulative_hazard_ = torch.tensor(
@@ -582,24 +787,38 @@ class GradientBoostingSurvivalAnalysis:
     def _concordance_index(
         self, durations: np.ndarray, events: np.ndarray, risk_scores: np.ndarray
     ) -> float:
-        """Calculate Harrell's concordance index."""
+        """Calculate Harrell's concordance index - vectorized."""
         n = len(durations)
-        concordant = 0
-        permissible = 0
-        
+        if n < 2:
+            return 0.5
+
+        event_mask = events == 1
+        if event_mask.sum() < 1:
+            return 0.5
+
+        # Sort by duration
+        order = np.argsort(durations)
+        dur_sorted = durations[order]
+        evt_sorted = events[order]
+        risk_sorted = risk_scores[order]
+
+        concordant = 0.0
+        discordant = 0.0
+        tied_risk = 0.0
+
         for i in range(n):
-            if events[i] == 0:
+            if evt_sorted[i] == 0:
                 continue
-            
-            for j in range(n):
-                if durations[j] > durations[i]:
-                    permissible += 1
-                    if risk_scores[i] > risk_scores[j]:
-                        concordant += 1
-                    elif risk_scores[i] == risk_scores[j]:
-                        concordant += 0.5
-        
+            # All j where T_j > T_i
+            later = dur_sorted > dur_sorted[i]
+            if not later.any():
+                continue
+            later_risks = risk_sorted[later]
+            concordant += np.sum(risk_sorted[i] > later_risks)
+            discordant += np.sum(risk_sorted[i] < later_risks)
+            tied_risk += np.sum(risk_sorted[i] == later_risks)
+
+        permissible = concordant + discordant + tied_risk
         if permissible == 0:
             return 0.5
-        
-        return concordant / permissible
+        return (concordant + 0.5 * tied_risk) / permissible

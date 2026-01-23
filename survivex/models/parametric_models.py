@@ -254,12 +254,22 @@ class WeibullAFTFitter:
         grad = np.concatenate([d_lambda, [d_log_sigma]])
         return -grad
     
-    def fit(self, T: np.ndarray, E: np.ndarray, X: Optional[np.ndarray] = None) -> 'WeibullAFTFitter':
-        """Fit model"""
+    def fit(self, X, T: np.ndarray, E: np.ndarray) -> 'WeibullAFTFitter':
+        """Fit Weibull AFT model.
+
+        Parameters:
+        -----------
+        X : array-like, shape (n_samples, n_features) or None
+            Covariate matrix. If None, fits intercept-only model.
+        T : array-like, shape (n_samples,)
+            Duration/survival times.
+        E : array-like, shape (n_samples,)
+            Event indicator (1=event, 0=censored).
+        """
         T = np.asarray(T).flatten()
         E = np.asarray(E).flatten()
         n = len(T)
-        
+
         if X is None:
             X = np.ones((n, 1))
         else:

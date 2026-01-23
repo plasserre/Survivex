@@ -1,22 +1,22 @@
 """
-Survival Tree Implementation with GPU Support
+Survival Tree Implementation - Optimized with Vectorized NumPy
 
 Mathematical Foundation:
 =======================
 
-A survival tree is a decision tree for censored survival data that recursively 
+A survival tree is a decision tree for censored survival data that recursively
 partitions the feature space to create homogeneous groups with respect to survival.
 
 Splitting Criterion:
 -------------------
 Uses the log-rank test statistic to measure separation between left and right child nodes:
 
-    L(split) = (O_L - E_L)^2 / V_L + (O_R - E_R)^2 / V_R
+    χ² = (O_L - E_L)² / V
 
 Where:
-    O_L, O_R = Observed events in left/right nodes
-    E_L, E_R = Expected events in left/right nodes
-    V_L, V_R = Variance of expected events
+    O_L = Observed events in left group
+    E_L = Expected events in left group (under null hypothesis)
+    V = Variance of the statistic
 
 The best split maximizes this log-rank statistic.
 
@@ -33,17 +33,6 @@ Where:
 The survival function is then:
     S(t) = exp(-H(t))
 
-Pruning:
---------
-Uses cost-complexity pruning with parameter α:
-
-    R_α(T) = R(T) + α|T|
-
-Where:
-    R(T) = Misclassification rate (1 - C-index)
-    |T| = Number of terminal nodes
-    α = Complexity parameter
-
 References:
 -----------
 - LeBlanc, M., & Crowley, J. (1993). "Survival trees by goodness of split"
@@ -52,13 +41,12 @@ References:
 
 Implementation Details:
 ----------------------
-- Uses PyTorch for GPU acceleration
-- Supports both exact and approximate splitting
-- Implements early stopping based on min_samples_split and max_depth
-- Provides feature importance based on split improvement
+- Uses vectorized numpy for fast CPU computation
+- Sorted-scan approach for finding best splits (O(n log n) per feature)
+- Efficient Nelson-Aalen using numpy bincount/cumsum
+- Feature importance based on split improvement
 """
 
-import torch
 import numpy as np
 from typing import Optional, Union, List, Tuple, Dict, Any
 from dataclasses import dataclass
@@ -67,41 +55,14 @@ import warnings
 
 @dataclass
 class Node:
-    """
-    Node in the survival tree.
-    
-    Attributes:
-    -----------
-    feature : int, optional
-        Feature index used for splitting (None for terminal nodes)
-    threshold : float, optional
-        Threshold value for splitting (None for terminal nodes)
-    left : Node, optional
-        Left child node
-    right : Node, optional
-        Right child node
-    cumulative_hazard_function : torch.Tensor, optional
-        CHF for terminal nodes
-    survival_function : torch.Tensor, optional
-        Survival function for terminal nodes
-    timeline : torch.Tensor, optional
-        Time points for CHF/survival
-    n_samples : int
-        Number of samples in this node
-    n_events : int
-        Number of events in this node
-    impurity : float
-        Node impurity (1 - C-index within node)
-    is_leaf : bool
-        Whether this is a terminal node
-    """
+    """Node in the survival tree."""
     feature: Optional[int] = None
     threshold: Optional[float] = None
     left: Optional['Node'] = None
     right: Optional['Node'] = None
-    cumulative_hazard_function: Optional[torch.Tensor] = None
-    survival_function: Optional[torch.Tensor] = None
-    timeline: Optional[torch.Tensor] = None
+    cumulative_hazard_function: Optional[np.ndarray] = None
+    survival_function: Optional[np.ndarray] = None
+    timeline: Optional[np.ndarray] = None
     n_samples: int = 0
     n_events: int = 0
     impurity: float = 0.0
@@ -110,11 +71,13 @@ class Node:
 
 class SurvivalTree:
     """
-    Survival Tree for right-censored data with GPU support.
-    
+    Survival Tree for right-censored data.
+
     A decision tree that uses the log-rank test statistic as splitting criterion
     and Nelson-Aalen estimator for terminal node predictions.
-    
+
+    Uses vectorized numpy for fast computation.
+
     Parameters:
     -----------
     max_depth : int, default=None
@@ -134,38 +97,9 @@ class SurvivalTree:
     random_state : int, optional
         Random seed for reproducibility
     device : str, default='cpu'
-        Device for computation ('cpu', 'cuda', 'mps')
-    
-    Attributes:
-    -----------
-    tree_ : Node
-        The root node of the fitted tree
-    n_features_ : int
-        Number of features
-    feature_importances_ : np.ndarray
-        Feature importance scores
-    max_features_ : int
-        Actual number of features to consider per split
-    
-    Examples:
-    ---------
-    >>> # Basic usage
-    >>> tree = SurvivalTree(max_depth=5, min_samples_split=20)
-    >>> tree.fit(X, durations, events)
-    >>> chf = tree.predict_cumulative_hazard(X_test)
-    >>> survival = tree.predict_survival_function(X_test)
-    
-    >>> # With GPU
-    >>> tree = SurvivalTree(device='cuda')
-    >>> tree.fit(X, durations, events)
-    
-    Notes:
-    ------
-    - Requires positive durations
-    - Events should be binary (0=censored, 1=event)
-    - GPU provides speedup for large datasets (n > 1000)
+        Kept for API compatibility (always uses CPU numpy)
     """
-    
+
     def __init__(
         self,
         max_depth: Optional[int] = None,
@@ -182,536 +116,476 @@ class SurvivalTree:
         self.max_features = max_features
         self.min_impurity_decrease = min_impurity_decrease
         self.random_state = random_state
-        
-        # Set device
-        if device == 'mps' and not torch.backends.mps.is_available():
-            warnings.warn("MPS device not available, using CPU")
-            device = 'cpu'
-        elif device == 'cuda' and not torch.cuda.is_available():
-            warnings.warn("CUDA not available, using CPU")
-            device = 'cpu'
-        
-        self.device = torch.device(device)
-        
-        # Set random seed
+        self.device = device  # kept for API compatibility
+
         if random_state is not None:
-            torch.manual_seed(random_state)
             np.random.seed(random_state)
-        
-        # Attributes set during fitting
+
         self.tree_ = None
         self.n_features_ = None
         self.feature_importances_ = None
         self.max_features_ = None
         self._is_fitted = False
-    
+
     def fit(
         self,
-        X: Union[np.ndarray, torch.Tensor],
-        durations: Union[np.ndarray, torch.Tensor],
-        events: Union[np.ndarray, torch.Tensor]
+        X: np.ndarray,
+        durations: np.ndarray,
+        events: np.ndarray
     ) -> 'SurvivalTree':
         """
         Build the survival tree.
-        
+
         Parameters:
         -----------
         X : array-like, shape (n_samples, n_features)
-            Training features
         durations : array-like, shape (n_samples,)
-            Time to event or censoring
         events : array-like, shape (n_samples,)
-            Event indicators (1=event, 0=censored)
-        
-        Returns:
-        --------
-        self : SurvivalTree
-            Fitted tree
         """
-        # Convert to tensors
-        X = self._to_tensor(X)
-        durations = self._to_tensor(durations)
-        events = self._to_tensor(events)
-        
-        # Validate inputs
-        self._validate_inputs(X, durations, events)
-        
+        # Convert to numpy
+        X = np.asarray(X, dtype=np.float64)
+        durations = np.asarray(durations, dtype=np.float64)
+        events = np.asarray(events, dtype=np.float64)
+
         n_samples, n_features = X.shape
         self.n_features_ = n_features
-        
-        # Determine max_features
         self.max_features_ = self._get_max_features(n_features)
-        
-        # Initialize feature importances
         self.feature_importances_ = np.zeros(n_features)
-        
-        # Build tree recursively
-        self.tree_ = self._build_tree(X, durations, events, depth=0)
-        
+
+        # Pre-sort data by duration for efficient splitting
+        sort_idx = np.argsort(durations)
+        X_sorted = X[sort_idx]
+        durations_sorted = durations[sort_idx]
+        events_sorted = events[sort_idx]
+
+        # Build tree
+        indices = np.arange(n_samples)
+        self.tree_ = self._build_tree(X_sorted, durations_sorted, events_sorted, indices, depth=0)
+
         # Normalize feature importances
-        if self.feature_importances_.sum() > 0:
-            self.feature_importances_ /= self.feature_importances_.sum()
-        
+        total = self.feature_importances_.sum()
+        if total > 0:
+            self.feature_importances_ /= total
+
         self._is_fitted = True
         return self
-    
+
     def _build_tree(
         self,
-        X: torch.Tensor,
-        durations: torch.Tensor,
-        events: torch.Tensor,
+        X: np.ndarray,
+        durations: np.ndarray,
+        events: np.ndarray,
+        indices: np.ndarray,
         depth: int
     ) -> Node:
-        """
-        Recursively build the tree.
-        
-        Stopping criteria:
-        1. Reached max_depth
-        2. Too few samples to split
-        3. All samples censored or all events
-        4. No valid split found
-        """
-        n_samples = X.shape[0]
-        n_events = int(events.sum().item())
-        
-        # Calculate node impurity (1 - C-index within node)
-        node_impurity = self._calculate_impurity(durations, events)
-        
-        # Create node
-        node = Node(
-            n_samples=n_samples,
-            n_events=n_events,
-            impurity=node_impurity
-        )
-        
-        # Check stopping criteria
+        """Recursively build the tree."""
+        n_samples = len(indices)
+        X_node = X[indices]
+        dur_node = durations[indices]
+        evt_node = events[indices]
+        n_events = int(evt_node.sum())
+
+        node = Node(n_samples=n_samples, n_events=n_events)
+
+        # Stopping criteria
         should_stop = (
             (self.max_depth is not None and depth >= self.max_depth) or
             (n_samples < self.min_samples_split) or
-            (n_events == 0) or  # All censored
-            (n_events == n_samples)  # All events
+            (n_events == 0) or
+            (n_events == n_samples)
         )
-        
+
         if should_stop:
-            # Make this a leaf node
             node.is_leaf = True
-            self._fit_terminal_node(node, durations, events)
+            self._fit_terminal_node(node, dur_node, evt_node)
             return node
-        
+
         # Find best split
-        best_split = self._find_best_split(X, durations, events)
-        
-        if best_split is None:
-            # No valid split found, make leaf
+        best_split = self._find_best_split(X_node, dur_node, evt_node)
+
+        if best_split is None or best_split['statistic'] < self.min_impurity_decrease:
             node.is_leaf = True
-            self._fit_terminal_node(node, durations, events)
+            self._fit_terminal_node(node, dur_node, evt_node)
             return node
-        
-        # Check minimum impurity decrease
-        if best_split['improvement'] < self.min_impurity_decrease:
-            node.is_leaf = True
-            self._fit_terminal_node(node, durations, events)
-            return node
-        
+
         # Update feature importance
-        self.feature_importances_[best_split['feature']] += best_split['improvement']
-        
-        # Split the data
-        left_mask = X[:, best_split['feature']] <= best_split['threshold']
+        self.feature_importances_[best_split['feature']] += best_split['statistic']
+
+        # Split
+        feature_vals = X_node[:, best_split['feature']]
+        left_mask = feature_vals <= best_split['threshold']
         right_mask = ~left_mask
-        
-        # Check minimum samples per leaf
+
         if left_mask.sum() < self.min_samples_leaf or right_mask.sum() < self.min_samples_leaf:
             node.is_leaf = True
-            self._fit_terminal_node(node, durations, events)
+            self._fit_terminal_node(node, dur_node, evt_node)
             return node
-        
-        # Set split information
+
         node.feature = best_split['feature']
         node.threshold = best_split['threshold']
-        
-        # Build children recursively
-        node.left = self._build_tree(
-            X[left_mask],
-            durations[left_mask],
-            events[left_mask],
-            depth + 1
-        )
-        
-        node.right = self._build_tree(
-            X[right_mask],
-            durations[right_mask],
-            events[right_mask],
-            depth + 1
-        )
-        
+
+        left_indices = indices[left_mask]
+        right_indices = indices[right_mask]
+
+        node.left = self._build_tree(X, durations, events, left_indices, depth + 1)
+        node.right = self._build_tree(X, durations, events, right_indices, depth + 1)
+
         return node
-    
+
     def _find_best_split(
         self,
-        X: torch.Tensor,
-        durations: torch.Tensor,
-        events: torch.Tensor
+        X: np.ndarray,
+        durations: np.ndarray,
+        events: np.ndarray
     ) -> Optional[Dict[str, Any]]:
         """
-        Find the best split using log-rank test statistic.
-        
-        Returns:
-        --------
-        best_split : dict or None
-            Dictionary with 'feature', 'threshold', 'improvement', 'statistic'
-            None if no valid split found
+        Find best split using vectorized log-rank scanning.
+
+        For each feature, sorts data and scans through possible split points,
+        computing log-rank statistics efficiently using running sums.
         """
         n_samples, n_features = X.shape
-        
+
         # Select features to try
         if self.max_features_ < n_features:
             features = np.random.choice(n_features, self.max_features_, replace=False)
         else:
-            features = range(n_features)
-        
+            features = np.arange(n_features)
+
         best_split = None
         best_statistic = -np.inf
-        
-        for feature_idx in features:
-            feature_values = X[:, feature_idx]
-            
-            # Get unique values as potential thresholds
-            unique_values = torch.unique(feature_values, sorted=True)
-            
-            # Try midpoints between consecutive unique values
-            if len(unique_values) < 2:
-                continue
-            
-            # For computational efficiency, limit number of thresholds
-            if len(unique_values) > 100:
-                # Sample 100 thresholds uniformly
-                indices = torch.linspace(0, len(unique_values) - 1, 100).long()
-                unique_values = unique_values[indices]
-            
-            thresholds = (unique_values[:-1] + unique_values[1:]) / 2
-            
-            for threshold in thresholds:
-                # Split samples
-                left_mask = feature_values <= threshold
-                right_mask = ~left_mask
-                
-                # Check minimum samples per leaf
-                if left_mask.sum() < self.min_samples_leaf or right_mask.sum() < self.min_samples_leaf:
-                    continue
-                
-                # Calculate log-rank statistic
-                statistic = self._log_rank_statistic(
-                    durations[left_mask], events[left_mask],
-                    durations[right_mask], events[right_mask]
-                )
-                
-                if statistic > best_statistic:
-                    best_statistic = statistic
-                    best_split = {
-                        'feature': feature_idx,
-                        'threshold': threshold.item(),
-                        'statistic': statistic,
-                        'improvement': statistic
-                    }
-        
-        return best_split
-    
-    def _log_rank_statistic(
-        self,
-        durations_left: torch.Tensor,
-        events_left: torch.Tensor,
-        durations_right: torch.Tensor,
-        events_right: torch.Tensor
-    ) -> float:
-        """
-        Calculate log-rank test statistic for a split.
-        
-        The log-rank statistic measures how different the survival curves are
-        between two groups. Higher values indicate better separation.
-        
-        Formula:
-        --------
-        χ² = (O_L - E_L)² / V
-        
-        Where:
-            O_L = Observed events in left group
-            E_L = Expected events in left group
-            V = Variance
-        """
-        # Combine data
-        all_durations = torch.cat([durations_left, durations_right])
-        all_events = torch.cat([events_left, events_right])
-        groups = torch.cat([
-            torch.zeros(len(durations_left), device=self.device),
-            torch.ones(len(durations_right), device=self.device)
-        ])
-        
-        # Get unique event times
-        event_times = torch.unique(all_durations[all_events == 1], sorted=True)
-        
-        if len(event_times) == 0:
-            return 0.0
-        
-        observed_left = 0.0
-        expected_left = 0.0
-        variance = 0.0
-        
-        for t in event_times:
-            # At risk in each group
-            at_risk_left = ((durations_left >= t).sum()).float()
-            at_risk_right = ((durations_right >= t).sum()).float()
-            at_risk_total = at_risk_left + at_risk_right
-            
-            if at_risk_total == 0:
-                continue
-            
-            # Events at time t
-            events_left_t = ((durations_left == t) & (events_left == 1)).sum().float()
-            events_right_t = ((durations_right == t) & (events_right == 1)).sum().float()
-            events_total_t = events_left_t + events_right_t
-            
-            if events_total_t == 0:
-                continue
-            
-            # Expected events in left group
-            expected_left_t = (at_risk_left / at_risk_total) * events_total_t
-            
-            # Variance contribution
-            if at_risk_total > 1:
-                variance_t = (
-                    (at_risk_left * at_risk_right * events_total_t * (at_risk_total - events_total_t)) /
-                    (at_risk_total ** 2 * (at_risk_total - 1))
-                )
-                variance += variance_t.item()
-            
-            observed_left += events_left_t.item()
-            expected_left += expected_left_t.item()
-        
-        # Calculate chi-square statistic
-        if variance > 0:
-            statistic = ((observed_left - expected_left) ** 2) / variance
+
+        # Pre-compute global stats for log-rank using a coarse time grid
+        # For efficiency, use at most MAX_GRID event times (quantiles)
+        MAX_GRID = 30
+        event_mask = events == 1
+        event_times_all = durations[event_mask]
+
+        if len(event_times_all) == 0:
+            return None
+
+        unique_event_times = np.unique(event_times_all)
+
+        # Use coarse grid if too many unique times
+        if len(unique_event_times) > MAX_GRID:
+            quantiles = np.linspace(0, 100, MAX_GRID + 2)[1:-1]
+            grid_times = np.percentile(event_times_all, quantiles)
+            grid_times = np.unique(grid_times)
         else:
-            statistic = 0.0
-        
-        return statistic
-    
+            grid_times = unique_event_times
+
+        n_grid = len(grid_times)
+
+        # For each grid time, compute: events and at-risk
+        # at_risk[k] = number of samples with duration >= grid_times[k]
+        sorted_dur = np.sort(durations)
+        at_risk = n_samples - np.searchsorted(sorted_dur, grid_times, side='left')
+        at_risk = at_risk.astype(np.float64)
+
+        # events at each grid time: sum events in [grid_times[k], grid_times[k+1])
+        # Use bins defined by grid_times
+        events_at_time = np.zeros(n_grid)
+        # Assign each event to its nearest grid time
+        event_grid_idx = np.searchsorted(grid_times, event_times_all, side='right') - 1
+        event_grid_idx = np.clip(event_grid_idx, 0, n_grid - 1)
+        np.add.at(events_at_time, event_grid_idx, 1.0)
+
+        # Assign all samples to grid buckets for at-risk tracking
+        # time_inverse[i] = grid bucket index for sample i
+        time_inverse = np.searchsorted(grid_times, durations, side='right') - 1
+        time_inverse = np.clip(time_inverse, 0, n_grid - 1)
+        n_times = n_grid
+
+        for feature_idx in features:
+            stat, threshold = self._best_split_for_feature(
+                X[:, feature_idx], durations, events,
+                grid_times, time_inverse, events_at_time, at_risk, n_times
+            )
+
+            if stat > best_statistic:
+                best_statistic = stat
+                best_split = {
+                    'feature': feature_idx,
+                    'threshold': threshold,
+                    'statistic': stat,
+                    'improvement': stat
+                }
+
+        return best_split if best_statistic > 0 else None
+
+    def _best_split_for_feature(
+        self,
+        feature_values: np.ndarray,
+        durations: np.ndarray,
+        events: np.ndarray,
+        unique_times: np.ndarray,
+        time_inverse: np.ndarray,
+        events_at_time: np.ndarray,
+        at_risk_total: np.ndarray,
+        n_times: int
+    ) -> Tuple[float, float]:
+        """
+        Find best threshold for a single feature using fully vectorized log-rank.
+
+        All candidate thresholds are evaluated simultaneously using matrix operations.
+        """
+        n_samples = len(feature_values)
+
+        # Sort by feature value
+        sort_idx = np.argsort(feature_values)
+        sorted_features = feature_values[sort_idx]
+        sorted_time_idx = time_inverse[sort_idx]
+        sorted_events = events[sort_idx]
+
+        # Pre-compute valid mask (times with events and at least 2 at risk)
+        valid = (events_at_time > 0) & (at_risk_total > 1)
+        if not valid.any():
+            return -np.inf, 0.0
+        valid_idx = np.where(valid)[0]
+        n_valid = len(valid_idx)
+
+        events_valid = events_at_time[valid_idx]
+        at_risk_valid = at_risk_total[valid_idx]
+
+        # Pre-compute variance denominator
+        var_denom = at_risk_valid ** 2 * (at_risk_valid - 1)
+        safe_var = var_denom > 0
+        if not safe_var.any():
+            return -np.inf, 0.0
+
+        # Determine candidate split positions
+        max_thresholds = min(80, n_samples - 2 * self.min_samples_leaf)
+        if max_thresholds <= 0:
+            return -np.inf, 0.0
+
+        # Find positions where feature value changes
+        change_mask = sorted_features[1:] != sorted_features[:-1]
+        change_positions = np.where(change_mask)[0] + 1  # position of first element in new group
+
+        if len(change_positions) == 0:
+            return -np.inf, 0.0
+
+        # Filter by min_samples_leaf
+        valid_mask = (change_positions >= self.min_samples_leaf) & \
+                     (change_positions <= n_samples - self.min_samples_leaf)
+        change_positions = change_positions[valid_mask]
+
+        if len(change_positions) == 0:
+            return -np.inf, 0.0
+
+        # Limit number of candidates
+        if len(change_positions) > max_thresholds:
+            idx = np.linspace(0, len(change_positions) - 1, max_thresholds, dtype=int)
+            change_positions = change_positions[idx]
+
+        n_candidates = len(change_positions)
+
+        # Build cumulative count and event matrices
+        # count_matrix[i, t] = 1 if sorted sample i maps to time bin t
+        # event_matrix[i, t] = event indicator for sorted sample i at time bin t
+        count_matrix = np.zeros((n_samples, n_times))
+        count_matrix[np.arange(n_samples), sorted_time_idx] = 1.0
+
+        event_matrix = np.zeros((n_samples, n_times))
+        event_matrix[np.arange(n_samples), sorted_time_idx] = sorted_events
+
+        # Cumulative sums along sample axis
+        # cum_count[p, t] = number of left-group samples at time t for split at position p
+        cum_count = np.cumsum(count_matrix, axis=0)
+        cum_events = np.cumsum(event_matrix, axis=0)
+
+        # Extract values at candidate positions (position p means left = [0..p-1])
+        # Index is p-1 since cumsum[p-1] = sum of [0..p-1]
+        left_count_at_time = cum_count[change_positions - 1]  # (n_candidates, n_times)
+        left_events_at_time = cum_events[change_positions - 1]  # (n_candidates, n_times)
+
+        # Left at-risk: reverse cumsum over time axis
+        # at_risk[t] = sum of counts for all t' >= t
+        left_at_risk = np.cumsum(left_count_at_time[:, ::-1], axis=1)[:, ::-1]
+
+        # Extract only valid time indices for log-rank
+        left_at_risk_v = left_at_risk[:, valid_idx]  # (n_candidates, n_valid)
+        left_events_v = left_events_at_time[:, valid_idx]  # (n_candidates, n_valid)
+
+        # Expected events in left group: (left_at_risk / total_at_risk) * events
+        expected_left = (left_at_risk_v / at_risk_valid[np.newaxis, :]) * events_valid[np.newaxis, :]
+
+        # Observed - Expected (summed over time)
+        obs_minus_exp = left_events_v.sum(axis=1) - expected_left.sum(axis=1)  # (n_candidates,)
+
+        # Variance for each candidate
+        right_at_risk_v = at_risk_valid[np.newaxis, :] - left_at_risk_v
+        # Only compute at safe positions
+        v_num = (left_at_risk_v[:, safe_var] * right_at_risk_v[:, safe_var] *
+                 events_valid[safe_var][np.newaxis, :] *
+                 (at_risk_valid[safe_var] - events_valid[safe_var])[np.newaxis, :])
+        v_den = var_denom[safe_var][np.newaxis, :]
+        variance_sum = (v_num / v_den).sum(axis=1)  # (n_candidates,)
+
+        # Log-rank statistic
+        valid_variance = variance_sum > 0
+        if not valid_variance.any():
+            return -np.inf, 0.0
+
+        stats = np.full(n_candidates, -np.inf)
+        stats[valid_variance] = (obs_minus_exp[valid_variance] ** 2) / variance_sum[valid_variance]
+
+        # Best candidate
+        best_idx = np.argmax(stats)
+        best_stat = stats[best_idx]
+        if best_stat <= 0:
+            return -np.inf, 0.0
+
+        pos = change_positions[best_idx]
+        best_threshold = (sorted_features[pos - 1] + sorted_features[pos]) / 2.0
+
+        return best_stat, best_threshold
+
     def _fit_terminal_node(
         self,
         node: Node,
-        durations: torch.Tensor,
-        events: torch.Tensor
+        durations: np.ndarray,
+        events: np.ndarray
     ):
-        """
-        Fit Nelson-Aalen estimator for terminal node.
-        
-        Estimates cumulative hazard function and survival function.
-        """
-        # Sort by duration
-        sorted_indices = torch.argsort(durations)
-        durations_sorted = durations[sorted_indices]
-        events_sorted = events[sorted_indices]
-        
+        """Fit Nelson-Aalen estimator for terminal node (vectorized)."""
         # Get unique event times
-        unique_times = torch.unique(durations_sorted[events_sorted == 1], sorted=True)
-        
-        if len(unique_times) == 0:
-            # No events - constant survival at 1
-            node.timeline = torch.tensor([0.0, durations_sorted.max().item()], device=self.device)
-            node.cumulative_hazard_function = torch.tensor([0.0, 0.0], device=self.device)
-            node.survival_function = torch.tensor([1.0, 1.0], device=self.device)
+        event_mask = events == 1
+        event_times = durations[event_mask]
+
+        if len(event_times) == 0:
+            node.timeline = np.array([0.0, durations.max() if len(durations) > 0 else 1.0])
+            node.cumulative_hazard_function = np.array([0.0, 0.0])
+            node.survival_function = np.array([1.0, 1.0])
             return
-        
-        # Add time 0
-        timeline = torch.cat([torch.tensor([0.0], device=self.device), unique_times])
-        
-        # Nelson-Aalen estimator
-        chf = torch.zeros(len(timeline), device=self.device)
-        
-        for i, t in enumerate(unique_times):
-            # Number at risk
-            at_risk = (durations_sorted >= t).sum().float()
-            
-            # Number of events
-            n_events = ((durations_sorted == t) & (events_sorted == 1)).sum().float()
-            
-            if at_risk > 0:
-                # Cumulative sum of hazard increments
-                if i > 0:
-                    chf[i + 1] = chf[i] + (n_events / at_risk)
-                else:
-                    chf[i + 1] = n_events / at_risk
-        
-        # Survival function
-        survival = torch.exp(-chf)
-        
+
+        unique_times = np.unique(event_times)
+
+        # Sort durations for searchsorted
+        sorted_dur = np.sort(durations)
+        n = len(durations)
+
+        # At-risk at each unique time: n - number with duration < t
+        at_risk = n - np.searchsorted(sorted_dur, unique_times, side='left')
+
+        # Events at each unique time
+        time_to_idx = {t: i for i, t in enumerate(unique_times)}
+        events_count = np.zeros(len(unique_times))
+        for t in event_times:
+            events_count[time_to_idx[t]] += 1
+
+        # Hazard increments
+        hazard_increments = events_count / np.maximum(at_risk, 1).astype(np.float64)
+
+        # Cumulative hazard (prepend 0 for time 0)
+        chf = np.concatenate([[0.0], np.cumsum(hazard_increments)])
+        timeline = np.concatenate([[0.0], unique_times])
+
         node.timeline = timeline
         node.cumulative_hazard_function = chf
-        node.survival_function = survival
-    
-    def _calculate_impurity(
-        self,
-        durations: torch.Tensor,
-        events: torch.Tensor
-    ) -> float:
-        """
-        Calculate node impurity as 1 - C-index.
-        
-        Lower impurity means better node homogeneity.
-        """
-        if events.sum() < 2:
-            return 0.0
-        
-        # Simple approximation: variance of log durations for events
-        event_durations = durations[events == 1]
-        if len(event_durations) < 2:
-            return 0.0
-        
-        log_durations = torch.log(event_durations + 1e-8)
-        impurity = torch.var(log_durations).item()
-        
-        return impurity
-    
+        node.survival_function = np.exp(-chf)
+
     def predict_cumulative_hazard(
         self,
-        X: Union[np.ndarray, torch.Tensor],
-        times: Optional[Union[np.ndarray, torch.Tensor]] = None
+        X: np.ndarray,
+        times: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """
         Predict cumulative hazard function.
-        
+
         Parameters:
         -----------
         X : array-like, shape (n_samples, n_features)
-            Test samples
         times : array-like, optional
-            Time points at which to evaluate CHF.
-            If None, uses union of all terminal node timelines.
-        
+            Time points for evaluation.
+
         Returns:
         --------
         chf : np.ndarray, shape (n_samples, n_times)
-            Cumulative hazard function for each sample
         """
         if not self._is_fitted:
             raise ValueError("Tree must be fitted before prediction")
-        
-        X = self._to_tensor(X)
-        
-        # Get predictions for each sample
-        predictions = []
-        for i in range(X.shape[0]):
-            node = self._traverse_tree(self.tree_, X[i])
-            
-            if times is None:
+
+        X = np.asarray(X, dtype=np.float64)
+
+        if times is not None:
+            times = np.asarray(times, dtype=np.float64)
+            n_times = len(times)
+            result = np.zeros((X.shape[0], n_times))
+
+            for i in range(X.shape[0]):
+                node = self._traverse_tree(self.tree_, X[i])
+                # Interpolate step function
+                result[i] = np.interp(times, node.timeline, node.cumulative_hazard_function,
+                                       left=0.0, right=node.cumulative_hazard_function[-1])
+            return result
+        else:
+            predictions = []
+            for i in range(X.shape[0]):
+                node = self._traverse_tree(self.tree_, X[i])
                 predictions.append({
                     'timeline': node.timeline,
                     'chf': node.cumulative_hazard_function
                 })
-            else:
-                # Interpolate to requested times
-                times_tensor = self._to_tensor(times)
-                chf_interp = self._interpolate_step_function(
-                    node.timeline,
-                    node.cumulative_hazard_function,
-                    times_tensor
-                )
-                predictions.append(chf_interp)
-        
-        if times is None:
-            # Return list of dictionaries
             return predictions
-        else:
-            # Stack into array
-            return torch.stack(predictions).cpu().numpy()
-    
+
     def predict_survival_function(
         self,
-        X: Union[np.ndarray, torch.Tensor],
-        times: Optional[Union[np.ndarray, torch.Tensor]] = None
+        X: np.ndarray,
+        times: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """
         Predict survival function.
-        
+
         Parameters:
         -----------
         X : array-like, shape (n_samples, n_features)
-            Test samples
         times : array-like, optional
-            Time points at which to evaluate survival.
-            If None, uses union of all terminal node timelines.
-        
+
         Returns:
         --------
         survival : np.ndarray, shape (n_samples, n_times)
-            Survival function for each sample
         """
         if not self._is_fitted:
             raise ValueError("Tree must be fitted before prediction")
-        
-        X = self._to_tensor(X)
-        
-        predictions = []
-        for i in range(X.shape[0]):
-            node = self._traverse_tree(self.tree_, X[i])
-            
-            if times is None:
+
+        X = np.asarray(X, dtype=np.float64)
+
+        if times is not None:
+            chf = self.predict_cumulative_hazard(X, times)
+            return np.exp(-chf)
+        else:
+            predictions = []
+            for i in range(X.shape[0]):
+                node = self._traverse_tree(self.tree_, X[i])
                 predictions.append({
                     'timeline': node.timeline,
                     'survival': node.survival_function
                 })
-            else:
-                times_tensor = self._to_tensor(times)
-                survival_interp = self._interpolate_step_function(
-                    node.timeline,
-                    node.survival_function,
-                    times_tensor
-                )
-                predictions.append(survival_interp)
-        
-        if times is None:
             return predictions
-        else:
-            return torch.stack(predictions).cpu().numpy()
-    
-    def _traverse_tree(self, node: Node, x: torch.Tensor) -> Node:
-        """
-        Traverse tree to find terminal node for sample x.
-        """
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict risk scores (sum of CHF)."""
+        if not self._is_fitted:
+            raise ValueError("Tree must be fitted before prediction")
+
+        X = np.asarray(X, dtype=np.float64)
+        risk_scores = np.zeros(X.shape[0])
+
+        for i in range(X.shape[0]):
+            node = self._traverse_tree(self.tree_, X[i])
+            risk_scores[i] = node.cumulative_hazard_function[-1] if len(node.cumulative_hazard_function) > 0 else 0.0
+
+        return risk_scores
+
+    def _traverse_tree(self, node: Node, x: np.ndarray) -> Node:
+        """Traverse tree to find terminal node for sample x."""
         if node.is_leaf:
             return node
-        
         if x[node.feature] <= node.threshold:
             return self._traverse_tree(node.left, x)
         else:
             return self._traverse_tree(node.right, x)
-    
-    def _interpolate_step_function(
-        self,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        x_new: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Interpolate step function (right-continuous).
-        
-        For each x_new[i], find the largest x[j] such that x[j] <= x_new[i]
-        and return y[j].
-        """
-        result = torch.zeros(len(x_new), device=self.device)
-        
-        for i, xi in enumerate(x_new):
-            # Find largest x <= xi
-            mask = x <= xi
-            if mask.any():
-                idx = torch.where(mask)[0][-1]
-                result[i] = y[idx]
-            else:
-                # Before first time point
-                result[i] = y[0] if len(y) > 0 else 0.0
-        
-        return result
-    
+
     def _get_max_features(self, n_features: int) -> int:
         """Determine actual number of features to consider per split."""
         if self.max_features is None:
@@ -724,52 +598,27 @@ class SurvivalTree:
             return max(1, int(np.log2(n_features)))
         else:
             raise ValueError(f"Invalid max_features: {self.max_features}")
-    
-    def _to_tensor(self, data: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
-        """Convert input to tensor on correct device."""
-        if isinstance(data, torch.Tensor):
-            return data.to(self.device)
-        else:
-            return torch.tensor(data, dtype=torch.float32, device=self.device)
-    
-    def _validate_inputs(
-        self,
-        X: torch.Tensor,
-        durations: torch.Tensor,
-        events: torch.Tensor
-    ):
-        """Validate input data."""
-        if X.shape[0] != len(durations) or X.shape[0] != len(events):
-            raise ValueError("X, durations, and events must have same number of samples")
-        
-        if (durations <= 0).any():
-            raise ValueError("All durations must be positive")
-        
-        if not torch.all((events == 0) | (events == 1)):
-            raise ValueError("Events must be binary (0 or 1)")
-    
+
     def get_depth(self) -> int:
         """Get the maximum depth of the tree."""
         if not self._is_fitted:
             raise ValueError("Tree must be fitted first")
         return self._get_node_depth(self.tree_)
-    
+
     def _get_node_depth(self, node: Node) -> int:
-        """Recursively calculate depth of a node."""
         if node.is_leaf:
             return 0
         left_depth = self._get_node_depth(node.left) if node.left else 0
         right_depth = self._get_node_depth(node.right) if node.right else 0
         return 1 + max(left_depth, right_depth)
-    
+
     def get_n_leaves(self) -> int:
         """Get the number of leaves in the tree."""
         if not self._is_fitted:
             raise ValueError("Tree must be fitted first")
         return self._count_leaves(self.tree_)
-    
+
     def _count_leaves(self, node: Node) -> int:
-        """Recursively count leaves."""
         if node.is_leaf:
             return 1
         left_count = self._count_leaves(node.left) if node.left else 0
