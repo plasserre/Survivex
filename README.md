@@ -425,6 +425,46 @@ pwp_gt.fit(X=X, gap_durations=df['gap_time'].values.astype(float),
            events=events, subject_id=ids, stratum=enums)
 ```
 
+### Frailty Models
+
+Account for unobserved heterogeneity (random effects) in clustered or recurrent event data:
+
+```python
+from survivex.models import FrailtyModel
+import numpy as np
+
+# Clustered data: multiple observations per subject
+# e.g., kidney dialysis data with 2 observations per patient
+
+# Prepare data
+durations = np.array([8, 16, 23, 13, 22, 28, ...])  # Event times
+events = np.array([1, 1, 1, 0, 1, 1, ...])           # 1=event, 0=censored
+cluster_id = np.array([1, 1, 2, 2, 3, 3, ...])       # Subject/cluster ID
+X = np.array([[28, 1, 0, 0, 0],                      # Covariates
+              [28, 1, 0, 0, 0],
+              [48, 2, 1, 0, 0], ...])
+
+# Gamma frailty (most common choice)
+# Model: h_i(t) = z_g * h_0(t) * exp(beta' X_i)
+# where z_g ~ Gamma(1/theta, 1/theta) with E[z]=1, Var[z]=theta
+frailty_gamma = FrailtyModel(distribution='gamma', tie_method='breslow')
+frailty_gamma.fit(X, durations, events, cluster_id)
+print(frailty_gamma.result_.summary())
+
+# Access results
+print(f"Coefficients: {frailty_gamma.coefficients_}")
+print(f"Frailty variance (theta): {frailty_gamma.frailty_variance_:.4f}")
+print(f"Cluster frailties: {frailty_gamma.frailty_values_}")
+
+# Gaussian (log-normal) frailty
+# log(z_g) ~ N(0, sigma^2)
+frailty_gauss = FrailtyModel(distribution='gaussian', tie_method='breslow')
+frailty_gauss.fit(X, durations, events, cluster_id)
+```
+
+The frailty model uses an EM algorithm to estimate both the regression coefficients
+and the frailty variance. Gamma frailty is recommended for most applications.
+
 ### Multi-State Models
 
 Model transitions between multiple health states over time:
@@ -529,7 +569,7 @@ GPU acceleration adds further speedup for large datasets with many covariates.
 
 ## Accuracy
 
-All models validated against reference implementations (11/11 tests pass):
+All models validated against reference implementations (12/12 tests pass):
 
 | Model | vs Reference | Max Difference |
 |-------|-------------|----------------|
@@ -541,6 +581,9 @@ All models validated against reference implementations (11/11 tests pass):
 | Andersen-Gill | R survival | 3.61e-08 |
 | PWP Total Time | R survival | 5.55e-16 |
 | PWP Gap Time | R survival | 2.22e-16 |
+| Frailty (Gamma) | R survival | 3.59e-02* |
+
+*Frailty model uses EM algorithm which may converge to slightly different optimum than R's penalized likelihood.
 
 See `validate_accuracy.ipynb` for the full validation notebook.
 
@@ -567,6 +610,7 @@ survivex/
 │   │   ├── andersen_gill.py         # Andersen-Gill recurrent events
 │   │   ├── recurrent_event.py       # PWP Total Time model
 │   │   ├── pwp.py                   # PWP Gap Time model
+│   │   ├── frailty.py               # Frailty models (gamma, gaussian)
 │   │   ├── survival_tree.py         # Survival Tree
 │   │   ├── random_survival_tree.py  # Random Survival Forest
 │   │   └── gradient_boosting_survival.py  # Gradient Boosting

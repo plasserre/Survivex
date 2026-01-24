@@ -48,6 +48,9 @@ from .andersen_gill import AndersenGillModel, AndersenGillResult
 from .recurrent_event import PWPTTModel, PWPTTResult
 from .pwp import PWPGTModel, PWPGTResult
 
+# Frailty models
+from .frailty import FrailtyModel, FrailtyResult
+
 __all__ = [
     # Non-parametric
     'KaplanMeierEstimator',
@@ -94,4 +97,8 @@ __all__ = [
     'PWPTTResult',
     'PWPGTModel',
     'PWPGTResult',
+
+    # Frailty models
+    'FrailtyModel',
+    'FrailtyResult',
 ]

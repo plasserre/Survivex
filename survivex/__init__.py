@@ -36,6 +36,7 @@ from survivex.models.parametric_models import (
     LogLogisticAFTFitter,
     ExponentialFitter
 )
+from survivex.models.frailty import FrailtyModel, FrailtyResult
 
 # Data utilities
 from survivex.core.data import SurvivalData
@@ -76,4 +77,8 @@ __all__ = [
     'LogNormalAFTFitter',
     'LogLogisticAFTFitter',
     'ExponentialFitter',
+
+    # Frailty
+    'FrailtyModel',
+    'FrailtyResult',
 ]
