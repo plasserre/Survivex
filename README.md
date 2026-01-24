@@ -544,65 +544,6 @@ All models validated against reference implementations (11/11 tests pass):
 
 See `validate_accuracy.ipynb` for the full validation notebook.
 
-## Complete Example: Clinical Trial Analysis
-
-```python
-import numpy as np
-import pandas as pd
-from survivex.models import (
-    KaplanMeierEstimator, LogRankTest, CoxPHModel, WeibullAFTFitter
-)
-
-# Simulated clinical trial: treatment vs control
-np.random.seed(123)
-n = 300
-
-# Treatment group (n=150): lower hazard
-T_treat = np.random.weibull(1.5, 150) * 60
-E_treat = np.random.binomial(1, 0.65, 150).astype(float)
-
-# Control group (n=150): higher hazard
-T_ctrl = np.random.weibull(1.5, 150) * 40
-E_ctrl = np.random.binomial(1, 0.75, 150).astype(float)
-
-# Combine
-durations = np.concatenate([T_treat, T_ctrl])
-events = np.concatenate([E_treat, E_ctrl])
-treatment = np.concatenate([np.ones(150), np.zeros(150)])
-age = np.random.normal(55, 10, n)
-X = np.column_stack([treatment, age])
-
-# 1. Kaplan-Meier curves by group
-km_treat = KaplanMeierEstimator()
-km_treat.fit(T_treat, E_treat)
-
-km_ctrl = KaplanMeierEstimator()
-km_ctrl.fit(T_ctrl, E_ctrl)
-
-print(f"Median survival - Treatment: {km_treat.median_survival_time():.1f}")
-print(f"Median survival - Control:   {km_ctrl.median_survival_time():.1f}")
-
-# 2. Log-rank test
-lr = LogRankTest()
-result = lr.test(durations, events, treatment)
-print(f"\nLog-rank test: chi2={result.test_statistic:.2f}, p={result.p_value:.4f}")
-
-# 3. Cox PH model (adjusted for age)
-cox = CoxPHModel(tie_method='efron')
-cox.fit(X, durations, events)
-
-print(f"\nCox PH Results:")
-print(f"  Treatment HR: {np.exp(cox.coefficients_[0]):.3f} "
-      f"(95% CI: {np.exp(cox.coefficients_[0] - 1.96*cox.standard_errors_[0]):.3f}-"
-      f"{np.exp(cox.coefficients_[0] + 1.96*cox.standard_errors_[0]):.3f})")
-print(f"  Age HR (per year): {np.exp(cox.coefficients_[1]):.3f}")
-print(f"  C-index: {cox.concordance_index_:.3f}")
-
-# 4. Weibull AFT for parametric analysis
-waft = WeibullAFTFitter()
-waft.fit(X, durations, events)
-print(f"\nWeibull shape (rho): {waft.rho_:.3f}")
-```
 
 ## Project Structure
 
