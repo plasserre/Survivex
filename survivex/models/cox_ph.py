@@ -537,6 +537,18 @@ class CoxPHModel:
 
         # Use vectorized Breslow if no ties OR if explicitly requested
         if self.tie_method == 'breslow' or not has_ties:
+            # For Breslow with ties: all events at the same time must use the same
+            # risk set (denominator). Fix cumulative sums so tied durations share
+            # the value at the first position of their tie group.
+            if has_ties and self.tie_method == 'breslow':
+                unique_durs, first_indices = np.unique(durations_np, return_index=True)
+                group_idx = np.searchsorted(unique_durs, durations_np)
+                first_of_group = first_indices[group_idx]
+                risk_cumsum_rev = risk_cumsum_rev[first_of_group]
+                weighted_X_cumsum_rev = weighted_X_cumsum_rev[first_of_group]
+                if weighted_XX_cumsum_rev is not None:
+                    weighted_XX_cumsum_rev = weighted_XX_cumsum_rev[first_of_group]
+
             # Breslow - fully vectorized (also exact for Efron when no ties)
             log_likelihood = np.sum(eta[event_mask] - np.log(risk_cumsum_rev[event_mask]))
             weighted_mean_X = weighted_X_cumsum_rev[event_mask] / risk_cumsum_rev[event_mask, np.newaxis]
@@ -681,13 +693,31 @@ class CoxPHModel:
             # Breslow - fully vectorized
             event_mask = events == 1
 
-            log_likelihood = torch.sum(eta[event_mask] - torch.log(risk_cumsum_rev[event_mask]))
-            weighted_mean_X = weighted_X_cumsum_rev[event_mask] / risk_cumsum_rev[event_mask].unsqueeze(1)
+            # For Breslow with ties: all events at the same time must use the same
+            # risk set. Fix cumulative sums so tied durations share the value at
+            # the first position of their tie group (data is sorted ascending).
+            unique_durs, inverse = torch.unique(durations, return_inverse=True)
+            counts = torch.bincount(inverse)
+            first_per_group = torch.zeros(len(unique_durs), dtype=torch.long, device=self.device)
+            if len(counts) > 1:
+                first_per_group[1:] = torch.cumsum(counts[:-1], dim=0)
+            first_of_group = first_per_group[inverse]
+
+            risk_cumsum_rev_adj = risk_cumsum_rev[first_of_group]
+            weighted_X_cumsum_rev_adj = weighted_X_cumsum_rev[first_of_group]
+
+            log_likelihood = torch.sum(eta[event_mask] - torch.log(risk_cumsum_rev_adj[event_mask]))
+            weighted_mean_X = weighted_X_cumsum_rev_adj[event_mask] / risk_cumsum_rev_adj[event_mask].unsqueeze(1)
             gradient = torch.sum(X[event_mask] - weighted_mean_X, dim=0)
 
             if compute_hessian:
-                risk_at_events = risk_cumsum_rev[event_mask].unsqueeze(1).unsqueeze(2)
-                weighted_mean_XX = weighted_XX_cumsum_rev[event_mask] / risk_at_events
+                if weighted_XX_cumsum_rev is not None:
+                    weighted_XX_cumsum_rev_adj = weighted_XX_cumsum_rev[first_of_group]
+                else:
+                    weighted_XX = X.unsqueeze(2) * X.unsqueeze(1) * risk_scores.unsqueeze(1).unsqueeze(2)
+                    weighted_XX_cumsum_rev_adj = torch.flip(torch.cumsum(torch.flip(weighted_XX, [0]), dim=0), [0])[first_of_group]
+                risk_at_events = risk_cumsum_rev_adj[event_mask].unsqueeze(1).unsqueeze(2)
+                weighted_mean_XX = weighted_XX_cumsum_rev_adj[event_mask] / risk_at_events
                 outer_mean = weighted_mean_X.unsqueeze(2) * weighted_mean_X.unsqueeze(1)
                 hessian = -torch.sum(weighted_mean_XX - outer_mean, dim=0)
             else:
