@@ -487,11 +487,13 @@ class CoxPHModel:
         compute_hessian : bool
             If False, skip Hessian computation (faster for line search).
         """
-        # Counting process data (non-trivial start times) always uses numpy path
-        # since the torch path relies on reverse cumsums that assume sorted right-censored data
         has_start_times = (start_times is not None and
                           not torch.all(start_times == 0).item())
-        if self.device.type == 'cpu' or self.tie_method == 'efron' or has_start_times:
+        if self.device.type != 'cpu' and has_start_times and self.tie_method == 'breslow':
+            # GPU-accelerated O(N log N) path for counting process Breslow
+            return self._compute_derivatives_counting_process_torch(
+                beta, X, durations, events, start_times, compute_hessian)
+        elif self.device.type == 'cpu' or self.tie_method == 'efron' or has_start_times:
             return self._compute_derivatives_numpy(beta, X, durations, events, start_times, compute_hessian)
         else:
             return self._compute_derivatives_torch(beta, X, durations, events, start_times, compute_hessian)
@@ -862,6 +864,120 @@ class CoxPHModel:
             torch.tensor(gradient, device=self.device, dtype=self.dtype),
             torch.tensor(hessian, device=self.device, dtype=self.dtype)
         )
+
+    def _compute_derivatives_counting_process_torch(self,
+                        beta: torch.Tensor,
+                        X: torch.Tensor,
+                        durations: torch.Tensor,
+                        events: torch.Tensor,
+                        start_times: torch.Tensor,
+                        compute_hessian: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        GPU-accelerated O(N log N) counting process derivatives using PyTorch.
+
+        Uses dual-sort + suffix sums + searchsorted for Breslow method.
+        All operations run on GPU for large-dataset parallelism.
+        """
+        n_samples, n_features = X.shape
+
+        # Compute linear predictor and risk scores on GPU
+        eta = torch.matmul(X, beta)
+        risk_scores = torch.exp(eta)
+
+        event_mask = events == 1
+        event_durations = durations[event_mask]
+        unique_event_times = torch.unique(event_durations)
+        n_times = len(unique_event_times)
+
+        if n_times == 0:
+            return (
+                torch.tensor(0.0, device=self.device, dtype=self.dtype),
+                torch.zeros(n_features, device=self.device, dtype=self.dtype),
+                torch.zeros((n_features, n_features), device=self.device, dtype=self.dtype)
+            )
+
+        # Count events at each unique event time
+        event_time_indices = torch.searchsorted(unique_event_times, event_durations)
+        d_counts = torch.zeros(n_times, device=self.device, dtype=self.dtype)
+        d_counts.scatter_add_(0, event_time_indices, torch.ones_like(event_durations, dtype=self.dtype))
+
+        # --- Sort by stop time, compute suffix cumsums ---
+        stop_order = torch.argsort(durations)
+        sorted_stops = durations[stop_order]
+        risk_by_stop = risk_scores[stop_order]
+        X_by_stop = X[stop_order]
+
+        wX_stop = X_by_stop * risk_by_stop.unsqueeze(1)
+
+        # Suffix sums (reverse cumsum): suffix[k] = sum_{i>=k} val[i]
+        suffix_risk_stop = torch.zeros(n_samples + 1, device=self.device, dtype=self.dtype)
+        suffix_risk_stop[:n_samples] = torch.flip(torch.cumsum(torch.flip(risk_by_stop, [0]), 0), [0])
+
+        suffix_wX_stop = torch.zeros(n_samples + 1, n_features, device=self.device, dtype=self.dtype)
+        suffix_wX_stop[:n_samples] = torch.flip(torch.cumsum(torch.flip(wX_stop, [0]), 0), [0])
+
+        # --- Sort by start time, compute suffix cumsums ---
+        start_order = torch.argsort(start_times)
+        sorted_starts = start_times[start_order]
+        risk_by_start = risk_scores[start_order]
+        X_by_start = X[start_order]
+
+        wX_start = X_by_start * risk_by_start.unsqueeze(1)
+
+        suffix_risk_start = torch.zeros(n_samples + 1, device=self.device, dtype=self.dtype)
+        suffix_risk_start[:n_samples] = torch.flip(torch.cumsum(torch.flip(risk_by_start, [0]), 0), [0])
+
+        suffix_wX_start = torch.zeros(n_samples + 1, n_features, device=self.device, dtype=self.dtype)
+        suffix_wX_start[:n_samples] = torch.flip(torch.cumsum(torch.flip(wX_start, [0]), 0), [0])
+
+        # --- Vectorized lookup for all event times ---
+        idx_stop = torch.searchsorted(sorted_stops, unique_event_times, side='left')
+        idx_start = torch.searchsorted(sorted_starts, unique_event_times, side='left')
+
+        sum_risk = suffix_risk_stop[idx_stop] - suffix_risk_start[idx_start]
+        sum_weighted_X = suffix_wX_stop[idx_stop] - suffix_wX_start[idx_start]
+
+        # Event sums per event time
+        X_events_all = X[event_mask]
+        eta_events_all = eta[event_mask]
+        sum_X_events = torch.zeros(n_times, n_features, device=self.device, dtype=self.dtype)
+        sum_X_events.scatter_add_(0, event_time_indices.unsqueeze(1).expand(-1, n_features), X_events_all)
+        sum_eta_events = torch.zeros(n_times, device=self.device, dtype=self.dtype)
+        sum_eta_events.scatter_add_(0, event_time_indices, eta_events_all)
+
+        # Log-likelihood
+        valid = sum_risk > 0
+        log_likelihood = sum_eta_events[valid].sum() - (d_counts[valid] * torch.log(sum_risk[valid])).sum()
+
+        # Gradient
+        weighted_means = sum_weighted_X[valid] / sum_risk[valid].unsqueeze(1)
+        gradient = sum_X_events[valid].sum(dim=0) - (d_counts[valid].unsqueeze(1) * weighted_means).sum(dim=0)
+
+        # Hessian
+        if compute_hessian:
+            # Suffix sums of outer products X⊗X*risk
+            wXX_stop = (X_by_stop.unsqueeze(2) * X_by_stop.unsqueeze(1) *
+                        risk_by_stop.unsqueeze(1).unsqueeze(2)).reshape(n_samples, n_features * n_features)
+            suffix_wXX_stop = torch.zeros(n_samples + 1, n_features * n_features, device=self.device, dtype=self.dtype)
+            suffix_wXX_stop[:n_samples] = torch.flip(torch.cumsum(torch.flip(wXX_stop, [0]), 0), [0])
+
+            wXX_start = (X_by_start.unsqueeze(2) * X_by_start.unsqueeze(1) *
+                         risk_by_start.unsqueeze(1).unsqueeze(2)).reshape(n_samples, n_features * n_features)
+            suffix_wXX_start = torch.zeros(n_samples + 1, n_features * n_features, device=self.device, dtype=self.dtype)
+            suffix_wXX_start[:n_samples] = torch.flip(torch.cumsum(torch.flip(wXX_start, [0]), 0), [0])
+
+            sum_wXX_flat = suffix_wXX_stop[idx_stop[valid]] - suffix_wXX_start[idx_start[valid]]
+            sum_wXX_all = sum_wXX_flat.reshape(-1, n_features, n_features)
+
+            d_valid = d_counts[valid]
+            sr_valid = sum_risk[valid]
+            scaled_wXX = sum_wXX_all / sr_valid.unsqueeze(1).unsqueeze(2)
+            outer_wm = weighted_means.unsqueeze(2) * weighted_means.unsqueeze(1)
+            hessian = -(d_valid.unsqueeze(1).unsqueeze(2) * (scaled_wXX - outer_wm)).sum(dim=0)
+        else:
+            hessian = torch.zeros((n_features, n_features), device=self.device, dtype=self.dtype)
+
+        return log_likelihood, gradient, hessian
 
     def _compute_derivatives_torch(self,
                         beta: torch.Tensor,
@@ -1818,6 +1934,90 @@ class CoxPHModel:
         # Use fully vectorized approach for Breslow (or no ties)
         use_vectorized = (self.tie_method == 'breslow' or max_ties == 1)
 
+        if use_vectorized and self.device.type != 'cpu':
+            # GPU-accelerated O(N log N) robust variance using PyTorch
+            dev = self.device
+            dt = self.dtype
+
+            X_t = torch.tensor(X_centered, device=dev, dtype=dt)
+            dur_t = torch.tensor(durations_sorted, device=dev, dtype=dt)
+            evt_t = torch.tensor(events_sorted, device=dev, dtype=dt)
+            start_t = torch.tensor(start_times_sorted, device=dev, dtype=dt)
+            exp_eta_t = torch.tensor(exp_eta, device=dev, dtype=dt)
+            event_times_t = torch.tensor(event_times, device=dev, dtype=dt)
+            d_counts_t = torch.tensor(d_counts, device=dev, dtype=dt)
+            cluster_idx_t = torch.tensor(cluster_idx_sorted, device=dev, dtype=torch.long)
+
+            score_matrix_t = torch.zeros(n_clusters, p, device=dev, dtype=dt)
+
+            # Suffix sums for stop
+            stop_order_t = torch.argsort(dur_t)
+            sorted_stops_t = dur_t[stop_order_t]
+            risk_by_stop_t = exp_eta_t[stop_order_t]
+            wX_stop_t = X_t[stop_order_t] * risk_by_stop_t.unsqueeze(1)
+
+            suffix_risk_stop_t = torch.zeros(n + 1, device=dev, dtype=dt)
+            suffix_risk_stop_t[:n] = torch.flip(torch.cumsum(torch.flip(risk_by_stop_t, [0]), 0), [0])
+            suffix_wX_stop_t = torch.zeros(n + 1, p, device=dev, dtype=dt)
+            suffix_wX_stop_t[:n] = torch.flip(torch.cumsum(torch.flip(wX_stop_t, [0]), 0), [0])
+
+            # Suffix sums for start
+            start_order_t = torch.argsort(start_t)
+            sorted_starts_t = start_t[start_order_t]
+            risk_by_start_t = exp_eta_t[start_order_t]
+            wX_start_t = X_t[start_order_t] * risk_by_start_t.unsqueeze(1)
+
+            suffix_risk_start_t = torch.zeros(n + 1, device=dev, dtype=dt)
+            suffix_risk_start_t[:n] = torch.flip(torch.cumsum(torch.flip(risk_by_start_t, [0]), 0), [0])
+            suffix_wX_start_t = torch.zeros(n + 1, p, device=dev, dtype=dt)
+            suffix_wX_start_t[:n] = torch.flip(torch.cumsum(torch.flip(wX_start_t, [0]), 0), [0])
+
+            # Lookup risk sums for event times
+            idx_stop_t = torch.searchsorted(sorted_stops_t, event_times_t, side='left')
+            idx_start_t = torch.searchsorted(sorted_starts_t, event_times_t, side='left')
+
+            sum_risk_t = suffix_risk_stop_t[idx_stop_t] - suffix_risk_start_t[idx_start_t]
+            sum_wX_t = suffix_wX_stop_t[idx_stop_t] - suffix_wX_start_t[idx_start_t]
+
+            valid_t = sum_risk_t > 0
+            expected_X_t = torch.zeros(n_event_times, p, device=dev, dtype=dt)
+            expected_X_t[valid_t] = sum_wX_t[valid_t] / sum_risk_t[valid_t].unsqueeze(1)
+
+            # Event contributions
+            event_mask_t = evt_t == 1
+            event_time_idx_t = torch.searchsorted(event_times_t, dur_t[event_mask_t])
+            event_X_t = X_t[event_mask_t]
+            event_scores_t = event_X_t - expected_X_t[event_time_idx_t]
+            event_clusters_t = cluster_idx_t[event_mask_t]
+            score_matrix_t.scatter_add_(0, event_clusters_t.unsqueeze(1).expand(-1, p), event_scores_t)
+
+            # At-risk contributions via prefix sums
+            d_over_risk_t = torch.zeros(n_event_times, device=dev, dtype=dt)
+            d_over_risk_t[valid_t] = d_counts_t[valid_t] / sum_risk_t[valid_t]
+
+            prefix_d_over_risk_t = torch.zeros(n_event_times + 1, device=dev, dtype=dt)
+            prefix_d_over_risk_t[1:] = torch.cumsum(d_over_risk_t, 0)
+
+            weighted_expX_t = d_over_risk_t.unsqueeze(1) * expected_X_t
+            prefix_weighted_expX_t = torch.zeros(n_event_times + 1, p, device=dev, dtype=dt)
+            prefix_weighted_expX_t[1:] = torch.cumsum(weighted_expX_t, 0)
+
+            lower_t = torch.searchsorted(event_times_t, start_t, side='right')
+            upper_t = torch.searchsorted(event_times_t, dur_t, side='right')
+
+            row_sums_t = prefix_d_over_risk_t[upper_t] - prefix_d_over_risk_t[lower_t]
+            term2_t = prefix_weighted_expX_t[upper_t] - prefix_weighted_expX_t[lower_t]
+
+            at_risk_contribs_t = -exp_eta_t.unsqueeze(1) * (X_t * row_sums_t.unsqueeze(1) - term2_t)
+            score_matrix_t.scatter_add_(0, cluster_idx_t.unsqueeze(1).expand(-1, p), at_risk_contribs_t)
+
+            # Compute B = S^T @ S and robust variance on GPU
+            B_t = score_matrix_t.T @ score_matrix_t
+            I_inv_t = torch.tensor(I_inv, device=dev, dtype=dt)
+            robust_var_t = I_inv_t @ B_t @ I_inv_t
+
+            return robust_var_t.cpu().numpy()
+
         if use_vectorized:
             # O(N log N) approach: dual-sort + suffix sums + prefix sums
             # Risk set at time t: {i: start_i < t AND stop_i >= t}
@@ -2093,7 +2293,7 @@ class StratifiedCoxPHModel:
 
             log_likelihood_history.append(log_lik.item())
 
-            # Check convergence
+            # Check convergence (gradient norm or delta norm)
             gradient_norm = torch.norm(gradient)
             if gradient_norm < self.tol:
                 converged = True
@@ -2116,7 +2316,12 @@ class StratifiedCoxPHModel:
                         beta_new, X_standardized, durations, events, strata, start_times
                     )
 
+                # Check delta-norm convergence (parameter change)
+                delta_norm = torch.norm(step_size * delta)
                 beta = beta_new
+                if delta_norm < self.tol:
+                    converged = True
+                    break
 
             except RuntimeError:
                 warnings.warn("Hessian is singular, adding regularization")
@@ -2483,6 +2688,112 @@ class StratifiedCoxPHModel:
         # Compute score contributions per cluster, per stratum
         unique_strata = np.unique(strata)
         use_vectorized = (self.tie_method == 'breslow')
+
+        if use_vectorized and self.device.type != 'cpu':
+            # GPU-accelerated O(N log N) robust variance for stratified model
+            dev = self.device
+            dt = self.dtype
+
+            X_t = torch.tensor(X_centered, device=dev, dtype=dt)
+            dur_t = torch.tensor(durations, device=dev, dtype=dt)
+            evt_t = torch.tensor(events, device=dev, dtype=dt)
+            start_t = torch.tensor(start_times_np, device=dev, dtype=dt)
+            exp_eta_t = torch.tensor(exp_eta, device=dev, dtype=dt)
+            strata_t = torch.tensor(strata, device=dev, dtype=dt)
+            cluster_idx_t = torch.tensor(cluster_indices, device=dev, dtype=torch.long)
+
+            score_matrix_t = torch.zeros(n_clusters, p, device=dev, dtype=dt)
+
+            for s_val in unique_strata:
+                s_mask = (strata == s_val)
+                s_mask_t = (strata_t == s_val)
+
+                X_s = X_t[s_mask_t]
+                dur_s = dur_t[s_mask_t]
+                evt_s = evt_t[s_mask_t]
+                exp_eta_s = exp_eta_t[s_mask_t]
+                cluster_idx_s = cluster_idx_t[s_mask_t]
+                start_s = start_t[s_mask_t]
+
+                event_mask_s = evt_s == 1
+                if not event_mask_s.any():
+                    continue
+
+                event_dur_s = dur_s[event_mask_s]
+                event_times_s = torch.unique(event_dur_s)
+                n_s = X_s.shape[0]
+                n_et_s = len(event_times_s)
+
+                if n_et_s == 0:
+                    continue
+
+                # Event counts
+                eti_s = torch.searchsorted(event_times_s, event_dur_s)
+                d_counts_s = torch.zeros(n_et_s, device=dev, dtype=dt)
+                d_counts_s.scatter_add_(0, eti_s, torch.ones_like(event_dur_s, dtype=dt))
+
+                # Suffix sums for stop
+                stop_order_s = torch.argsort(dur_s)
+                sorted_stops_s = dur_s[stop_order_s]
+                risk_by_stop_s = exp_eta_s[stop_order_s]
+                wX_stop_s = X_s[stop_order_s] * risk_by_stop_s.unsqueeze(1)
+
+                sfx_risk_stop = torch.zeros(n_s + 1, device=dev, dtype=dt)
+                sfx_risk_stop[:n_s] = torch.flip(torch.cumsum(torch.flip(risk_by_stop_s, [0]), 0), [0])
+                sfx_wX_stop = torch.zeros(n_s + 1, p, device=dev, dtype=dt)
+                sfx_wX_stop[:n_s] = torch.flip(torch.cumsum(torch.flip(wX_stop_s, [0]), 0), [0])
+
+                # Suffix sums for start
+                start_order_s = torch.argsort(start_s)
+                sorted_starts_s = start_s[start_order_s]
+                risk_by_start_s = exp_eta_s[start_order_s]
+                wX_start_s = X_s[start_order_s] * risk_by_start_s.unsqueeze(1)
+
+                sfx_risk_start = torch.zeros(n_s + 1, device=dev, dtype=dt)
+                sfx_risk_start[:n_s] = torch.flip(torch.cumsum(torch.flip(risk_by_start_s, [0]), 0), [0])
+                sfx_wX_start = torch.zeros(n_s + 1, p, device=dev, dtype=dt)
+                sfx_wX_start[:n_s] = torch.flip(torch.cumsum(torch.flip(wX_start_s, [0]), 0), [0])
+
+                idx_stop_s = torch.searchsorted(sorted_stops_s, event_times_s, side='left')
+                idx_start_s = torch.searchsorted(sorted_starts_s, event_times_s, side='left')
+
+                sum_risk_s = sfx_risk_stop[idx_stop_s] - sfx_risk_start[idx_start_s]
+                sum_wX_s = sfx_wX_stop[idx_stop_s] - sfx_wX_start[idx_start_s]
+
+                valid_s = sum_risk_s > 0
+                expected_X_s = torch.zeros(n_et_s, p, device=dev, dtype=dt)
+                expected_X_s[valid_s] = sum_wX_s[valid_s] / sum_risk_s[valid_s].unsqueeze(1)
+
+                # Event contributions
+                event_X_s = X_s[event_mask_s]
+                event_scores_s = event_X_s - expected_X_s[eti_s]
+                event_clusters_s = cluster_idx_s[event_mask_s]
+                score_matrix_t.scatter_add_(0, event_clusters_s.unsqueeze(1).expand(-1, p), event_scores_s)
+
+                # At-risk contributions via prefix sums
+                d_over_risk_s = torch.zeros(n_et_s, device=dev, dtype=dt)
+                d_over_risk_s[valid_s] = d_counts_s[valid_s] / sum_risk_s[valid_s]
+
+                pfx_dor = torch.zeros(n_et_s + 1, device=dev, dtype=dt)
+                pfx_dor[1:] = torch.cumsum(d_over_risk_s, 0)
+
+                wexpX_s = d_over_risk_s.unsqueeze(1) * expected_X_s
+                pfx_wexpX = torch.zeros(n_et_s + 1, p, device=dev, dtype=dt)
+                pfx_wexpX[1:] = torch.cumsum(wexpX_s, 0)
+
+                lower_s = torch.searchsorted(event_times_s, start_s, side='right')
+                upper_s = torch.searchsorted(event_times_s, dur_s, side='right')
+
+                row_sums_s = pfx_dor[upper_s] - pfx_dor[lower_s]
+                term2_s = pfx_wexpX[upper_s] - pfx_wexpX[lower_s]
+
+                at_risk_contribs_s = -exp_eta_s.unsqueeze(1) * (X_s * row_sums_s.unsqueeze(1) - term2_s)
+                score_matrix_t.scatter_add_(0, cluster_idx_s.unsqueeze(1).expand(-1, p), at_risk_contribs_s)
+
+            B_t = score_matrix_t.T @ score_matrix_t
+            I_inv_t = torch.tensor(I_inv, device=dev, dtype=dt)
+            robust_var_t = I_inv_t @ B_t @ I_inv_t
+            return robust_var_t.cpu().numpy()
 
         for s in unique_strata:
             stratum_mask = (strata == s)
