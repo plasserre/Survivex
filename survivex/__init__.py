@@ -37,6 +37,11 @@ from survivex.models.parametric_models import (
     ExponentialFitter
 )
 
+# Data utilities
+from survivex.core.data import SurvivalData
+from survivex.datasets.loaders import load_survival_dataset
+from survivex.datasets.validators import validate_survival_data
+
 # Define what's available when doing "from survivex import *"
 __all__ = [
     # Non-parametric

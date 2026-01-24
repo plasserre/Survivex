@@ -229,10 +229,16 @@ def _handle_categorical_features(df, feature_cols, handle_categorical, verbose):
         
     elif handle_categorical == 'encode':
         # Label encode categorical features
-        from sklearn.preprocessing import LabelEncoder
-        
         for col in feature_cols:
             if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
+                try:
+                    from sklearn.preprocessing import LabelEncoder
+                except ImportError:
+                    raise ImportError(
+                        "scikit-learn required for categorical encoding. "
+                        "Install with: pip install scikit-learn\n"
+                        "Or use handle_categorical='drop' to skip categorical features."
+                    )
                 if verbose:
                     print(f"   Encoding categorical feature '{col}'")
                 

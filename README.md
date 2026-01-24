@@ -51,7 +51,7 @@ X = np.random.randn(200, 3)  # 3 covariates
 # Kaplan-Meier survival curve
 km = KaplanMeierEstimator()
 km.fit(durations, events)
-print(f"Median survival: {km.median_survival_time_:.1f}")
+print(f"Median survival: {km.median_survival_time():.1f}")
 
 # Cox Proportional Hazards
 cox = CoxPHModel()
@@ -62,9 +62,45 @@ print(f"C-index: {cox.concordance_index_:.3f}")
 
 ## Loading Data
 
-### From a CSV file
+SurviveX provides built-in tools for loading, validating, and preparing survival data from any source. You can either use the **universal loader** (recommended) or work with numpy arrays directly.
 
-The most common format for survival data is a CSV with columns for time, event status, and covariates:
+### Universal Loader (recommended)
+
+The `load_survival_dataset` function handles everything: loading, validation, missing values, categorical encoding, and format conversion:
+
+```python
+from survivex.datasets.loaders import load_survival_dataset
+
+# From a CSV file — auto-detects time and event columns
+data = load_survival_dataset("patient_data.csv", verbose=True)
+
+# Explicitly specify columns
+data = load_survival_dataset(
+    "patient_data.csv",
+    time_col="time_months",
+    event_col="died",
+    feature_cols=["age", "treatment", "tumor_size"],
+    handle_missing="drop",   # or 'impute', 'warn', 'raise'
+    validate=True,
+    verbose=True
+)
+
+# The result is a SurvivalData object — use it directly with models
+from survivex.models import CoxPHModel
+cox = CoxPHModel()
+cox.fit(data.X.numpy(), data.time.numpy(), data.event.numpy().astype(float))
+```
+
+The loader automatically:
+- Validates data (checks for non-positive times, missing values, event rates)
+- Handles missing values (drop, impute with median/mean, or raise)
+- Encodes categorical features (label encoding, one-hot, or drop)
+- Converts event columns (handles 0/1, 1/2, True/False, Dead/Alive, Yes/No formats)
+- Supports date ranges (`time_col=["start_date", "end_date"]` computes duration in days)
+
+### From a CSV file (manual)
+
+If you prefer working with numpy arrays directly:
 
 ```python
 import pandas as pd
@@ -78,7 +114,6 @@ df = pd.read_csv("patient_data.csv")
 # patient_id, time_months, died, age, treatment, tumor_size
 # 1, 24.5, 1, 65, 1, 3.2
 # 2, 36.0, 0, 52, 0, 1.8   (0 = censored, still alive at last follow-up)
-# ...
 
 # Extract arrays
 durations = df['time_months'].values.astype(float)
@@ -88,95 +123,177 @@ covariates = df[['age', 'treatment', 'tumor_size']].values.astype(float)
 # Fit Cox model
 cox = CoxPHModel()
 cox.fit(covariates, durations, events)
-
-# Print results
-for i, name in enumerate(['age', 'treatment', 'tumor_size']):
-    hr = np.exp(cox.coefficients_[i])
-    se = cox.standard_errors_[i]
-    print(f"{name}: HR={hr:.3f}, SE={se:.4f}")
 ```
 
 ### From lifelines datasets
 
-If you have lifelines installed, you can use its built-in datasets:
-
 ```python
-from lifelines.datasets import load_rossi, load_lung, load_gbsg2
-from survivex.models import CoxPHModel, KaplanMeierEstimator
-import numpy as np
+from survivex.datasets.loaders import load_survival_dataset
 
-# Load the Rossi recidivism dataset (432 subjects, 7 covariates)
-rossi = load_rossi()
+# Load any lifelines dataset by name (auto-detected)
+data = load_survival_dataset(
+    "rossi",                    # Dataset name — auto-loads from lifelines
+    time_col="week",
+    event_col="arrest",
+    feature_cols=["fin", "age", "race", "wexp", "prio"],
+    verbose=True
+)
 
-durations = rossi['week'].values.astype(float)
-events = rossi['arrest'].values.astype(float)
-covariate_cols = ['fin', 'age', 'race', 'wexp', 'mar', 'paro', 'prio']
-X = rossi[covariate_cols].values.astype(float)
-
-# Fit Cox PH model
-cox = CoxPHModel(tie_method='efron')
-cox.fit(X, durations, events)
-
-print("Cox PH Results (Rossi dataset):")
-print(f"{'Covariate':<8} {'Coef':>8} {'HR':>8} {'p-value':>10}")
-print("-" * 40)
-from scipy.stats import norm
-for i, name in enumerate(covariate_cols):
-    coef = cox.coefficients_[i]
-    hr = np.exp(coef)
-    z = coef / cox.standard_errors_[i]
-    p = 2 * (1 - norm.cdf(abs(z)))
-    print(f"{name:<8} {coef:>8.4f} {hr:>8.4f} {p:>10.4f}")
-
-print(f"\nConcordance index: {cox.concordance_index_:.4f}")
+# Available datasets: rossi, lung, waltons, kidney, stanford, dd, regression
 ```
 
-### From R datasets via rpy2
+Or load manually with lifelines:
 
 ```python
+from lifelines.datasets import load_rossi
+from survivex.models import CoxPHModel
 import numpy as np
 
-# If you have rpy2 installed, you can load R datasets directly
-try:
-    import rpy2.robjects as ro
-    from rpy2.robjects import pandas2ri
-    pandas2ri.activate()
+rossi = load_rossi()
+durations = rossi['week'].values.astype(float)
+events = rossi['arrest'].values.astype(float)
+X = rossi[['fin', 'age', 'race', 'wexp', 'mar', 'paro', 'prio']].values.astype(float)
 
-    ro.r('library(survival)')
-    lung = ro.r('lung')
+cox = CoxPHModel(tie_method='efron')
+cox.fit(X, durations, events)
+print(f"C-index: {cox.concordance_index_:.4f}")
+```
 
-    durations = lung['time'].values.astype(float)
-    events = (lung['status'].values == 2).astype(float)  # R uses 2=dead, 1=censored
-    X = lung[['age', 'sex']].values.astype(float)
-except ImportError:
-    print("rpy2 not installed — use CSV or lifelines datasets instead")
+### Using SurvivalData objects
+
+The `SurvivalData` class provides a validated container for survival data with automatic type conversion:
+
+```python
+from survivex.core.data import SurvivalData
+
+# From arrays
+data = SurvivalData(
+    time=[5, 10, 15, 20, 25],
+    event=[1, 0, 1, 1, 0],
+    X=[[65, 1], [70, 0], [55, 1], [60, 0], [75, 1]],
+    feature_names=['age', 'sex']
+)
+print(data)  # SurvivalData(n_obs=5, n_events=3, event_rate=60.0%, n_features=2)
+
+# From a pandas DataFrame (auto-detects numeric features)
+import pandas as pd
+df = pd.DataFrame({
+    'time': [12, 24, 36, 48, 60],
+    'event': [1, 0, 1, 1, 0],
+    'age': [55.0, 60.0, 45.0, 70.0, 50.0],
+    'bmi': [22.0, 28.0, 25.0, 30.0, 24.0],
+})
+data = SurvivalData.from_pandas(df, time_col='time', event_col='event')
+print(data.feature_names)  # ['age', 'bmi'] — auto-detected
+
+# Convert back to pandas
+df_out = data.to_pandas()
+```
+
+`SurvivalData` validates on creation — it raises errors for:
+- Non-positive survival times
+- Event values not in {0, 1}
+- Mismatched array lengths
+
+### Working with date columns
+
+If your data has start/end dates instead of durations:
+
+```python
+from survivex.datasets.loaders import load_survival_dataset
+
+data = load_survival_dataset(
+    "clinical_trial.csv",
+    time_col=["enrollment_date", "last_followup_date"],  # Computes days between dates
+    event_col="died",
+    feature_cols=["age", "treatment_arm"],
+    verbose=True
+)
+# Duration is automatically computed in days
+```
+
+### Data validation
+
+Validate your data before fitting models to catch common issues:
+
+```python
+from survivex.datasets.validators import validate_survival_data
+import pandas as pd
+
+df = pd.read_csv("my_data.csv")
+
+result = validate_survival_data(
+    df,
+    time_col='survival_months',
+    event_col='status',
+    feature_cols=['age', 'stage', 'treatment'],
+    verbose=True
+)
+# Prints a validation report:
+#   - Checks for non-positive times
+#   - Checks for missing values
+#   - Warns about low event rates
+#   - Warns about outliers
+#   - Reports data summary statistics
+
+if result['valid']:
+    print("Data is ready for analysis")
+else:
+    print(f"Issues found: {result['issues']}")
+```
+
+### Converting recurrent event data
+
+Transform repeated events data into counting process (start, stop] format for Andersen-Gill or PWP models:
+
+```python
+from survivex.datasets.converters import convert_recurrent_events
+from survivex.models import AndersenGillModel
+import pandas as pd
+
+# Your data: one row per event per patient
+df = pd.DataFrame({
+    'patient_id': [1, 1, 1, 2, 2, 3],
+    'time_days':  [10, 25, 40, 15, 35, 20],
+    'readmitted': [1, 1, 0, 1, 0, 0],  # 1=readmitted, 0=censored
+    'age':        [65, 65, 65, 50, 50, 70],
+    'severity':   [2, 3, 3, 1, 2, 1]
+})
+
+# Convert to counting process format
+cp_data = convert_recurrent_events(
+    df, subject_col='patient_id', time_col='time_days', event_col='readmitted'
+)
+# Result has: patient_id, start, stop, event, age, severity
+
+# Fit Andersen-Gill model
+ag = AndersenGillModel(tie_method='breslow')
+ag.fit(
+    X=cp_data[['age', 'severity']].values.astype(float),
+    time_start=cp_data['start'].values.astype(float),
+    time_stop=cp_data['stop'].values.astype(float),
+    events=cp_data['event'].values.astype(float),
+    subject_id=cp_data['patient_id'].values
+)
+print(ag.result_.summary())
 ```
 
 ### Handling missing data
 
-SurviveX expects clean numpy arrays. Handle missing values before fitting:
+The universal loader handles missing values automatically, or you can do it manually:
 
 ```python
-import pandas as pd
-import numpy as np
-from survivex.models import CoxPHModel
-
-df = pd.read_csv("data.csv")
+from survivex.datasets.loaders import load_survival_dataset
 
 # Option 1: Drop rows with missing values
-df_clean = df.dropna(subset=['time', 'event', 'age', 'treatment'])
+data = load_survival_dataset("data.csv", handle_missing="drop")
 
-# Option 2: Impute missing values
-df['age'].fillna(df['age'].median(), inplace=True)
+# Option 2: Impute with median (numeric) / mode (categorical)
+data = load_survival_dataset("data.csv", handle_missing="impute",
+                             impute_strategy="median")
 
-# Convert to arrays
-durations = df_clean['time'].values.astype(float)
-events = df_clean['event'].values.astype(float)
-X = df_clean[['age', 'treatment']].values.astype(float)
-
-# Now fit
-cox = CoxPHModel()
-cox.fit(X, durations, events)
+# Option 3: Raise error if any missing values found
+data = load_survival_dataset("data.csv", handle_missing="raise")
 ```
 
 ## Available Models
@@ -462,8 +579,8 @@ km_treat.fit(T_treat, E_treat)
 km_ctrl = KaplanMeierEstimator()
 km_ctrl.fit(T_ctrl, E_ctrl)
 
-print(f"Median survival - Treatment: {km_treat.median_survival_time_:.1f}")
-print(f"Median survival - Control:   {km_ctrl.median_survival_time_:.1f}")
+print(f"Median survival - Treatment: {km_treat.median_survival_time():.1f}")
+print(f"Median survival - Control:   {km_ctrl.median_survival_time():.1f}")
 
 # 2. Log-rank test
 lr = LogRankTest()
@@ -492,6 +609,12 @@ print(f"\nWeibull shape (rho): {waft.rho_:.3f}")
 ```
 survivex/
 ├── survivex/
+│   ├── core/
+│   │   └── data.py                  # SurvivalData class (validated container)
+│   ├── datasets/
+│   │   ├── loaders.py               # Universal dataset loader
+│   │   ├── validators.py            # Data validation utilities
+│   │   └── converters.py            # Format converters (lifelines, sksurv, pycox)
 │   ├── models/
 │   │   ├── kaplan_meier.py          # Kaplan-Meier estimator
 │   │   ├── nelson_aalen.py          # Nelson-Aalen estimator
