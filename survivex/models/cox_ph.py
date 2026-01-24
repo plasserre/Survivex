@@ -528,18 +528,15 @@ class CoxPHModel:
         else:
             weighted_XX_cumsum_rev = None
 
-        # Check for ties - if no ties, use fast vectorized Breslow (equivalent to Efron)
+        # Check for ties
         event_mask = events_np == 1
         event_times = durations_np[event_mask]
         unique_times_check, counts = np.unique(event_times, return_counts=True)
         max_ties = np.max(counts) if len(counts) > 0 else 1
         has_ties = max_ties > 1
 
-        # Use vectorized Breslow if no ties OR if explicitly requested
         if self.tie_method == 'breslow' or not has_ties:
-            # For Breslow with ties: all events at the same time must use the same
-            # risk set (denominator). Fix cumulative sums so tied durations share
-            # the value at the first position of their tie group.
+            # Breslow: tied events share the same risk set denominator
             if has_ties and self.tie_method == 'breslow':
                 unique_durs, first_indices = np.unique(durations_np, return_index=True)
                 group_idx = np.searchsorted(unique_durs, durations_np)
@@ -549,7 +546,7 @@ class CoxPHModel:
                 if weighted_XX_cumsum_rev is not None:
                     weighted_XX_cumsum_rev = weighted_XX_cumsum_rev[first_of_group]
 
-            # Breslow - fully vectorized (also exact for Efron when no ties)
+            # Vectorized Breslow (also exact when no ties)
             log_likelihood = np.sum(eta[event_mask] - np.log(risk_cumsum_rev[event_mask]))
             weighted_mean_X = weighted_X_cumsum_rev[event_mask] / risk_cumsum_rev[event_mask, np.newaxis]
             gradient = np.sum(X_np[event_mask] - weighted_mean_X, axis=0)
@@ -690,12 +687,9 @@ class CoxPHModel:
             weighted_XX_cumsum_rev = None
 
         if self.tie_method == 'breslow':
-            # Breslow - fully vectorized
             event_mask = events == 1
 
-            # For Breslow with ties: all events at the same time must use the same
-            # risk set. Fix cumulative sums so tied durations share the value at
-            # the first position of their tie group (data is sorted ascending).
+            # Tied events share the same risk set denominator
             unique_durs, inverse = torch.unique(durations, return_inverse=True)
             counts = torch.bincount(inverse)
             first_per_group = torch.zeros(len(unique_durs), dtype=torch.long, device=self.device)
