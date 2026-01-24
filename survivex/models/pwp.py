@@ -75,11 +75,13 @@ class PWPGTModel:
     print(model.result_.summary())
     """
     
-    def __init__(self, 
+    def __init__(self,
                  tie_method: str = 'efron',
-                 alpha: float = 0.05):
+                 alpha: float = 0.05,
+                 device: str = None):
         self.tie_method = tie_method
         self.alpha = alpha
+        self.device = device
         self._is_fitted = False
         self.cox_model_ = None
         
@@ -147,7 +149,7 @@ class PWPGTModel:
         from .cox_ph import StratifiedCoxPHModel
         
         # Fit stratified Cox model with gap time
-        self.cox_model_ = StratifiedCoxPHModel(tie_method=self.tie_method)
+        self.cox_model_ = StratifiedCoxPHModel(tie_method=self.tie_method, device=self.device)
         
         # Fit the model (gap times naturally start at 0)
         self.cox_model_.fit(

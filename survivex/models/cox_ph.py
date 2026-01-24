@@ -487,7 +487,11 @@ class CoxPHModel:
         compute_hessian : bool
             If False, skip Hessian computation (faster for line search).
         """
-        if self.device.type == 'cpu' or self.tie_method == 'efron':
+        # Counting process data (non-trivial start times) always uses numpy path
+        # since the torch path relies on reverse cumsums that assume sorted right-censored data
+        has_start_times = (start_times is not None and
+                          not torch.all(start_times == 0).item())
+        if self.device.type == 'cpu' or self.tie_method == 'efron' or has_start_times:
             return self._compute_derivatives_numpy(beta, X, durations, events, start_times, compute_hessian)
         else:
             return self._compute_derivatives_torch(beta, X, durations, events, start_times, compute_hessian)
@@ -674,20 +678,140 @@ class CoxPHModel:
 
     def _compute_derivatives_counting_process(self, beta_np, X_np, durations_np, events_np,
                                                start_np, compute_hessian=True):
-        """Compute partial likelihood derivatives for counting process (start, stop] data."""
+        """
+        Compute partial likelihood derivatives for counting process (start, stop] data.
+
+        O(N log N) implementation: uses dual-sort + suffix sums + searchsorted to
+        compute risk set sums for all event times without constructing O(N*T) matrix.
+        Falls back to per-event-time loop only for Efron with ties > 1.
+        """
         n_samples, n_features = X_np.shape
         eta = X_np @ beta_np
         risk_scores = np.exp(eta)
 
         event_mask = events_np == 1
         unique_event_times = np.unique(durations_np[event_mask])
+        n_times = len(unique_event_times)
 
+        if n_times == 0:
+            return (
+                torch.tensor(0.0, device=self.device, dtype=self.dtype),
+                torch.tensor(np.zeros(n_features), device=self.device, dtype=self.dtype),
+                torch.tensor(np.zeros((n_features, n_features)), device=self.device, dtype=self.dtype)
+            )
+
+        # Count events at each unique event time
+        event_time_indices = np.searchsorted(unique_event_times, durations_np[event_mask])
+        d_counts = np.zeros(n_times, dtype=int)
+        np.add.at(d_counts, event_time_indices, 1)
+
+        # Check if we can use fully vectorized Breslow (no ties or breslow method)
+        max_ties = d_counts.max()
+        use_vectorized = (self.tie_method == 'breslow' or max_ties == 1)
+
+        if use_vectorized:
+            # O(N log N) approach: dual-sort + suffix sums + searchsorted
+            # Risk set at time t: {i: start_i < t AND stop_i >= t}
+            # = {i: stop_i >= t} \ {i: start_i >= t}
+
+            # Sort by stop time ascending, compute suffix cumsums
+            stop_order = np.argsort(durations_np)
+            sorted_stops = durations_np[stop_order]
+            risk_by_stop = risk_scores[stop_order]
+            X_by_stop = X_np[stop_order]
+
+            # Suffix sums for stop (reversed cumsum): suffix[k] = sum_{i>=k} val[i]
+            wR_stop = risk_by_stop  # (N,)
+            wX_stop = X_by_stop * risk_by_stop[:, None]  # (N, p)
+
+            suffix_risk_stop = np.empty(n_samples + 1)
+            suffix_risk_stop[n_samples] = 0.0
+            suffix_risk_stop[:n_samples] = np.cumsum(wR_stop[::-1])[::-1]
+
+            suffix_wX_stop = np.empty((n_samples + 1, n_features))
+            suffix_wX_stop[n_samples] = 0.0
+            suffix_wX_stop[:n_samples] = np.cumsum(wX_stop[::-1], axis=0)[::-1]
+
+            # Sort by start time ascending, compute suffix cumsums
+            start_order = np.argsort(start_np)
+            sorted_starts = start_np[start_order]
+            risk_by_start = risk_scores[start_order]
+            X_by_start = X_np[start_order]
+
+            wR_start = risk_by_start
+            wX_start = X_by_start * risk_by_start[:, None]
+
+            suffix_risk_start = np.empty(n_samples + 1)
+            suffix_risk_start[n_samples] = 0.0
+            suffix_risk_start[:n_samples] = np.cumsum(wR_start[::-1])[::-1]
+
+            suffix_wX_start = np.empty((n_samples + 1, n_features))
+            suffix_wX_start[n_samples] = 0.0
+            suffix_wX_start[:n_samples] = np.cumsum(wX_start[::-1], axis=0)[::-1]
+
+            # Vectorized lookup: for each event time t, find risk set sums
+            # stop >= t: first index in sorted_stops where value >= t
+            idx_stop = np.searchsorted(sorted_stops, unique_event_times, side='left')
+            # start >= t: first index in sorted_starts where value >= t
+            idx_start = np.searchsorted(sorted_starts, unique_event_times, side='left')
+
+            sum_risk = suffix_risk_stop[idx_stop] - suffix_risk_start[idx_start]
+            sum_weighted_X = suffix_wX_stop[idx_stop] - suffix_wX_start[idx_start]
+
+            # Event X sums per event time (vectorized using add.at)
+            sum_X_events = np.zeros((n_times, n_features))
+            sum_eta_events = np.zeros(n_times)
+            X_events_all = X_np[event_mask]
+            eta_events_all = eta[event_mask]
+            np.add.at(sum_X_events, event_time_indices, X_events_all)
+            np.add.at(sum_eta_events, event_time_indices, eta_events_all)
+
+            # Log-likelihood: sum(eta_events) - d_t * log(sum_risk)
+            valid = sum_risk > 0
+            log_likelihood = sum_eta_events[valid].sum() - (d_counts[valid] * np.log(sum_risk[valid])).sum()
+
+            # Gradient: sum(X_events) - d_t * weighted_mean
+            weighted_means = sum_weighted_X[valid] / sum_risk[valid, None]  # (T_valid, p)
+            gradient = sum_X_events[valid].sum(axis=0) - (d_counts[valid, None] * weighted_means).sum(axis=0)
+
+            # Hessian via suffix sums of outer products
+            if compute_hessian:
+                # Compute suffix sums of X⊗X*risk for both stop and start orders
+                wXX_stop = (X_by_stop[:, :, None] * X_by_stop[:, None, :] *
+                            risk_by_stop[:, None, None]).reshape(n_samples, n_features * n_features)
+                suffix_wXX_stop = np.empty((n_samples + 1, n_features * n_features))
+                suffix_wXX_stop[n_samples] = 0.0
+                suffix_wXX_stop[:n_samples] = np.cumsum(wXX_stop[::-1], axis=0)[::-1]
+
+                wXX_start = (X_by_start[:, :, None] * X_by_start[:, None, :] *
+                             risk_by_start[:, None, None]).reshape(n_samples, n_features * n_features)
+                suffix_wXX_start = np.empty((n_samples + 1, n_features * n_features))
+                suffix_wXX_start[n_samples] = 0.0
+                suffix_wXX_start[:n_samples] = np.cumsum(wXX_start[::-1], axis=0)[::-1]
+
+                sum_wXX_flat = suffix_wXX_stop[idx_stop[valid]] - suffix_wXX_start[idx_start[valid]]
+                sum_wXX_all = sum_wXX_flat.reshape(-1, n_features, n_features)
+
+                d_valid = d_counts[valid]
+                sr_valid = sum_risk[valid]
+                scaled_wXX = sum_wXX_all / sr_valid[:, None, None]
+                outer_wm = weighted_means[:, :, None] * weighted_means[:, None, :]
+                hessian = -(d_valid[:, None, None] * (scaled_wXX - outer_wm)).sum(axis=0)
+            else:
+                hessian = np.zeros((n_features, n_features))
+
+            return (
+                torch.tensor(log_likelihood, device=self.device, dtype=self.dtype),
+                torch.tensor(gradient, device=self.device, dtype=self.dtype),
+                torch.tensor(hessian, device=self.device, dtype=self.dtype)
+            )
+
+        # Fallback: loop over event times (for Efron with ties or very large data)
         log_likelihood = 0.0
         gradient = np.zeros(n_features)
         hessian = np.zeros((n_features, n_features))
 
         for t in unique_event_times:
-            # Risk set: start < t AND stop >= t
             at_risk = (start_np < t) & (durations_np >= t)
             at_event = (durations_np == t) & event_mask
 
@@ -1678,69 +1802,151 @@ class CoxPHModel:
         cluster_to_idx = {c: i for i, c in enumerate(unique_clusters)}
         score_matrix = np.zeros((n_clusters, p))
 
+        # Pre-map cluster IDs to indices for vectorized accumulation
+        cluster_idx_sorted = np.array([cluster_to_idx[c] for c in cluster_id_sorted])
+
         event_times = np.unique(durations_sorted[events_sorted == 1])
+        n_event_times = len(event_times)
 
-        for t in event_times:
-            at_risk = (start_times_sorted < t) & (durations_sorted >= t)
-            at_event = (durations_sorted == t) & (events_sorted == 1)
+        # Count events at each unique event time
+        event_durations = durations_sorted[events_sorted == 1]
+        event_time_indices = np.searchsorted(event_times, event_durations)
+        d_counts = np.zeros(n_event_times, dtype=int)
+        np.add.at(d_counts, event_time_indices, 1)
+        max_ties = d_counts.max()
 
-            if not np.any(at_event):
-                continue
+        # Use fully vectorized approach for Breslow (or no ties)
+        use_vectorized = (self.tie_method == 'breslow' or max_ties == 1)
 
-            event_indices = np.where(at_event)[0]
-            risk_indices = np.where(at_risk)[0]
-            n_events = len(event_indices)
+        if use_vectorized:
+            # O(N log N) approach: dual-sort + suffix sums + prefix sums
+            # Risk set at time t: {i: start_i < t AND stop_i >= t}
 
-            risk_exp = exp_eta[at_risk]
-            risk_X = X_centered[at_risk]
-            sum_risk_exp = np.sum(risk_exp)
+            # --- Step 1: Compute sum_risk[t] and sum_wX[t] via suffix sums ---
+            stop_order = np.argsort(durations_sorted)
+            sorted_stops = durations_sorted[stop_order]
+            risk_by_stop = exp_eta[stop_order]
+            X_by_stop = X_centered[stop_order]
 
-            if sum_risk_exp == 0:
-                continue
+            wX_stop = X_by_stop * risk_by_stop[:, None]
+            suffix_risk_stop = np.empty(n + 1)
+            suffix_risk_stop[n] = 0.0
+            suffix_risk_stop[:n] = np.cumsum(risk_by_stop[::-1])[::-1]
+            suffix_wX_stop = np.empty((n + 1, p))
+            suffix_wX_stop[n] = 0.0
+            suffix_wX_stop[:n] = np.cumsum(wX_stop[::-1], axis=0)[::-1]
 
-            if self.tie_method == 'efron' and n_events > 1:
-                event_exp = exp_eta[at_event]
-                event_X = X_centered[at_event]
-                sum_event_exp = np.sum(event_exp)
+            start_order = np.argsort(start_times_sorted)
+            sorted_starts = start_times_sorted[start_order]
+            risk_by_start = exp_eta[start_order]
+            X_by_start = X_centered[start_order]
 
-                for k in range(n_events):
-                    event_idx = event_indices[k]
-                    frac = k / n_events
-                    denom = sum_risk_exp - frac * sum_event_exp
+            wX_start = X_by_start * risk_by_start[:, None]
+            suffix_risk_start = np.empty(n + 1)
+            suffix_risk_start[n] = 0.0
+            suffix_risk_start[:n] = np.cumsum(risk_by_start[::-1])[::-1]
+            suffix_wX_start = np.empty((n + 1, p))
+            suffix_wX_start[n] = 0.0
+            suffix_wX_start[:n] = np.cumsum(wX_start[::-1], axis=0)[::-1]
 
-                    if denom <= 0:
-                        continue
+            idx_stop = np.searchsorted(sorted_stops, event_times, side='left')
+            idx_start = np.searchsorted(sorted_starts, event_times, side='left')
 
-                    num = (np.sum(risk_X * risk_exp[:, np.newaxis], axis=0) -
-                        frac * np.sum(event_X * event_exp[:, np.newaxis], axis=0))
-                    expected_X = num / denom
+            sum_risk = suffix_risk_stop[idx_stop] - suffix_risk_start[idx_start]
+            sum_wX = suffix_wX_stop[idx_stop] - suffix_wX_start[idx_start]
 
-                    # Event contribution
-                    score_contrib = X_centered[event_idx] - expected_X
-                    cluster_idx = cluster_to_idx[cluster_id_sorted[event_idx]]
-                    score_matrix[cluster_idx] += score_contrib
+            valid = sum_risk > 0
+            expected_X_all = np.zeros((n_event_times, p))
+            expected_X_all[valid] = sum_wX[valid] / sum_risk[valid, None]
 
-                    # At-risk contribution
-                    for r_idx in risk_indices:
-                        hazard_contrib = exp_eta[r_idx] / denom
-                        at_risk_score = -hazard_contrib * (X_centered[r_idx] - expected_X)
-                        c_idx = cluster_to_idx[cluster_id_sorted[r_idx]]
-                        score_matrix[c_idx] += at_risk_score
-            else:
-                expected_X = np.sum(risk_X * risk_exp[:, np.newaxis], axis=0) / sum_risk_exp
+            # --- Step 2: Event contributions (already O(N_events)) ---
+            event_mask_sorted = events_sorted == 1
+            event_obs_time_idx = event_time_indices
+            event_X = X_centered[event_mask_sorted]
+            event_exp_X = expected_X_all[event_obs_time_idx]
+            event_scores = event_X - event_exp_X
+            event_clusters = cluster_idx_sorted[event_mask_sorted]
+            np.add.at(score_matrix, event_clusters, event_scores)
 
-                # Event contributions
-                for event_idx in event_indices:
-                    score_contrib = X_centered[event_idx] - expected_X
-                    cluster_idx = cluster_to_idx[cluster_id_sorted[event_idx]]
-                    score_matrix[cluster_idx] += score_contrib
+            # --- Step 3: At-risk contributions via prefix sums over event times ---
+            # For each obs i: row_sums[i] = sum_{t in (start_i, stop_i]} d_over_risk[t]
+            #                  term2[i] = sum_{t in (start_i, stop_i]} d_over_risk[t] * expected_X[t]
+            d_over_risk = np.zeros(n_event_times)
+            d_over_risk[valid] = d_counts[valid] / sum_risk[valid]
 
-                # At-risk contributions
-                for r_idx in risk_indices:
-                    hazard_contrib = n_events * exp_eta[r_idx] / sum_risk_exp
-                    at_risk_score = -hazard_contrib * (X_centered[r_idx] - expected_X)
-                    c_idx = cluster_to_idx[cluster_id_sorted[r_idx]]
-                    score_matrix[c_idx] += at_risk_score
+            # Prefix sums over event times (sorted ascending)
+            prefix_d_over_risk = np.zeros(n_event_times + 1)
+            prefix_d_over_risk[1:] = np.cumsum(d_over_risk)
+
+            weighted_expX = d_over_risk[:, None] * expected_X_all  # (T, p)
+            prefix_weighted_expX = np.zeros((n_event_times + 1, p))
+            prefix_weighted_expX[1:] = np.cumsum(weighted_expX, axis=0)
+
+            # For each obs i: find event times in (start_i, stop_i]
+            # lower = first event_time > start_i
+            lower = np.searchsorted(event_times, start_times_sorted, side='right')
+            # upper = last event_time <= stop_i, i.e., first event_time > stop_i
+            upper = np.searchsorted(event_times, durations_sorted, side='right')
+
+            row_sums = prefix_d_over_risk[upper] - prefix_d_over_risk[lower]
+            term2 = prefix_weighted_expX[upper] - prefix_weighted_expX[lower]
+
+            at_risk_contribs = -exp_eta[:, None] * (X_centered * row_sums[:, None] - term2)
+            np.add.at(score_matrix, cluster_idx_sorted, at_risk_contribs)
+        else:
+            # Fallback: loop over event times (for Efron with ties or very large data)
+            for t in event_times:
+                at_risk = (start_times_sorted < t) & (durations_sorted >= t)
+                at_event = (durations_sorted == t) & (events_sorted == 1)
+
+                if not np.any(at_event):
+                    continue
+
+                n_events_t = int(np.sum(at_event))
+                risk_exp = exp_eta[at_risk]
+                risk_X = X_centered[at_risk]
+                sum_risk_exp = np.sum(risk_exp)
+
+                if sum_risk_exp == 0:
+                    continue
+
+                if self.tie_method == 'efron' and n_events_t > 1:
+                    event_exp = exp_eta[at_event]
+                    event_X_t = X_centered[at_event]
+                    sum_event_exp = np.sum(event_exp)
+                    sum_wX_risk = np.sum(risk_X * risk_exp[:, None], axis=0)
+                    sum_wX_event = np.sum(event_X_t * event_exp[:, None], axis=0)
+
+                    event_indices = np.where(at_event)[0]
+                    risk_cluster_idx = cluster_idx_sorted[at_risk]
+                    risk_exp_arr = exp_eta[at_risk]
+                    risk_X_arr = X_centered[at_risk]
+
+                    for k in range(n_events_t):
+                        frac = k / n_events_t
+                        denom = sum_risk_exp - frac * sum_event_exp
+                        if denom <= 0:
+                            continue
+
+                        expected_X_k = (sum_wX_risk - frac * sum_wX_event) / denom
+                        event_idx = event_indices[k]
+                        c_idx = cluster_idx_sorted[event_idx]
+                        score_matrix[c_idx] += X_centered[event_idx] - expected_X_k
+
+                        hazard_contribs = risk_exp_arr / denom
+                        at_risk_scores = -hazard_contribs[:, None] * (risk_X_arr - expected_X_k[None, :])
+                        np.add.at(score_matrix, risk_cluster_idx, at_risk_scores)
+                else:
+                    expected_X_t = np.sum(risk_X * risk_exp[:, None], axis=0) / sum_risk_exp
+
+                    event_cluster_idx = cluster_idx_sorted[at_event]
+                    event_scores_t = X_centered[at_event] - expected_X_t[None, :]
+                    np.add.at(score_matrix, event_cluster_idx, event_scores_t)
+
+                    risk_cluster_idx = cluster_idx_sorted[at_risk]
+                    hazard_contribs = n_events_t * exp_eta[at_risk] / sum_risk_exp
+                    at_risk_scores = -hazard_contribs[:, None] * (X_centered[at_risk] - expected_X_t[None, :])
+                    np.add.at(score_matrix, risk_cluster_idx, at_risk_scores)
 
         B = score_matrix.T @ score_matrix
         robust_var = I_inv @ B @ I_inv
@@ -2013,36 +2219,70 @@ class StratifiedCoxPHModel:
         X_centered = X - self.X_mean_
         risk_scores = torch.exp(torch.matmul(X_centered, beta))
         
-        # Estimate for each stratum
+        # Estimate for each stratum (vectorized)
         for s in self.unique_strata_:
             stratum_mask = (strata == s)
-            
-            durations_s = durations[stratum_mask]
-            events_s = events[stratum_mask]
-            risk_scores_s = risk_scores[stratum_mask]
-            
+
+            durations_s = durations[stratum_mask].cpu().numpy()
+            events_s = events[stratum_mask].cpu().numpy()
+            risk_scores_s = risk_scores[stratum_mask].cpu().numpy()
+
             # Get unique event times in this stratum
-            event_times = durations_s[events_s == 1]
-            unique_times = torch.unique(event_times)
-            
-            baseline_hazard = []
-            timeline = []
-            
-            for t in unique_times:
-                at_risk_mask = durations_s >= t
-                sum_risk = torch.sum(risk_scores_s[at_risk_mask])
-                
-                event_mask = (durations_s == t) & (events_s == 1)
-                d_t = torch.sum(event_mask)
-                
-                h0_t = d_t / sum_risk
-                
-                timeline.append(t.item())
-                baseline_hazard.append(h0_t.item())
-            
+            event_mask_s = events_s == 1
+            unique_times = np.unique(durations_s[event_mask_s])
+
+            if len(unique_times) == 0:
+                s_key = s.item()
+                self.timelines_[s_key] = torch.tensor([], device=self.device)
+                self.baseline_hazards_[s_key] = torch.tensor([], device=self.device)
+                self.baseline_cumulative_hazards_[s_key] = torch.tensor([], device=self.device)
+                self.baseline_survivals_[s_key] = torch.tensor([], device=self.device)
+                continue
+
+            n_times_s = len(unique_times)
+
+            # Count events at each unique time
+            event_dur = durations_s[event_mask_s]
+            eidx = np.searchsorted(unique_times, event_dur)
+            d_counts_s = np.zeros(n_times_s)
+            np.add.at(d_counts_s, eidx, 1.0)
+
+            # Compute sum_risk at each event time using suffix sums on sorted durations
+            # For baseline hazard: at_risk = {i: durations_s[i] >= t}
+            # Also account for start_times if available
+            sort_idx = np.argsort(durations_s)
+            sorted_dur = durations_s[sort_idx]
+            sorted_risk = risk_scores_s[sort_idx]
+
+            suffix_risk = np.empty(len(durations_s) + 1)
+            suffix_risk[-1] = 0.0
+            suffix_risk[:-1] = np.cumsum(sorted_risk[::-1])[::-1]
+
+            # For each event time t: sum_risk = suffix at first index where sorted_dur >= t
+            idx_t = np.searchsorted(sorted_dur, unique_times, side='left')
+
+            # If start_times are available, subtract those with start >= t
+            if hasattr(self, 'start_times_') and self.start_times_ is not None:
+                start_s = self.start_times_[stratum_mask].cpu().numpy()
+                start_sort_idx = np.argsort(start_s)
+                sorted_starts_s = start_s[start_sort_idx]
+                sorted_risk_start = risk_scores_s[start_sort_idx]
+                suffix_risk_start = np.empty(len(start_s) + 1)
+                suffix_risk_start[-1] = 0.0
+                suffix_risk_start[:-1] = np.cumsum(sorted_risk_start[::-1])[::-1]
+                idx_start_t = np.searchsorted(sorted_starts_s, unique_times, side='left')
+                sum_risk_arr = suffix_risk[idx_t] - suffix_risk_start[idx_start_t]
+            else:
+                sum_risk_arr = suffix_risk[idx_t]
+
+            # Baseline hazard: h0(t) = d(t) / sum_risk(t)
+            valid_s = sum_risk_arr > 0
+            baseline_hazard_arr = np.zeros(n_times_s)
+            baseline_hazard_arr[valid_s] = d_counts_s[valid_s] / sum_risk_arr[valid_s]
+
             s_key = s.item()
-            self.timelines_[s_key] = torch.tensor(timeline, device=self.device)
-            self.baseline_hazards_[s_key] = torch.tensor(baseline_hazard, device=self.device)
+            self.timelines_[s_key] = torch.tensor(unique_times, device=self.device, dtype=self.dtype)
+            self.baseline_hazards_[s_key] = torch.tensor(baseline_hazard_arr, device=self.device, dtype=self.dtype)
             self.baseline_cumulative_hazards_[s_key] = torch.cumsum(
                 self.baseline_hazards_[s_key], dim=0
             )
@@ -2231,8 +2471,18 @@ class StratifiedCoxPHModel:
         else:
             start_times_np = np.zeros_like(durations)
 
+        # Map cluster IDs to indices for vectorized accumulation
+        cluster_indices = np.array([cluster_to_idx[c] for c in cluster_id])
+
+        # Get start_times if available
+        if hasattr(self, 'start_times_') and self.start_times_ is not None:
+            start_times_np2 = self.start_times_.cpu().numpy()
+        else:
+            start_times_np2 = start_times_np
+
         # Compute score contributions per cluster, per stratum
         unique_strata = np.unique(strata)
+        use_vectorized = (self.tie_method == 'breslow')
 
         for s in unique_strata:
             stratum_mask = (strata == s)
@@ -2240,72 +2490,144 @@ class StratifiedCoxPHModel:
             dur_s = durations[stratum_mask]
             evt_s = events[stratum_mask]
             exp_eta_s = exp_eta[stratum_mask]
-            cluster_s = cluster_id[stratum_mask]
+            cluster_idx_s = cluster_indices[stratum_mask]
             start_s = start_times_np[stratum_mask]
 
-            event_times = np.unique(dur_s[evt_s == 1])
+            event_times_s = np.unique(dur_s[evt_s == 1])
+            n_s = len(X_s)
+            n_event_times_s = len(event_times_s)
 
-            for t in event_times:
-                at_risk = (start_s < t) & (dur_s >= t)
-                at_event = (dur_s == t) & (evt_s == 1)
+            if n_event_times_s == 0:
+                continue
 
-                if not np.any(at_event):
-                    continue
+            # Count events at each unique event time
+            event_mask_s = evt_s == 1
+            event_durations_s = dur_s[event_mask_s]
+            event_time_indices_s = np.searchsorted(event_times_s, event_durations_s)
+            d_counts_s = np.zeros(n_event_times_s, dtype=int)
+            np.add.at(d_counts_s, event_time_indices_s, 1)
+            max_ties_s = d_counts_s.max() if n_event_times_s > 0 else 0
 
-                event_indices = np.where(at_event)[0]
-                risk_indices = np.where(at_risk)[0]
-                n_events = len(event_indices)
+            if use_vectorized or max_ties_s <= 1:
+                # O(N_s log N_s) approach using suffix/prefix sums
 
-                risk_exp = exp_eta_s[at_risk]
-                risk_X = X_s[at_risk]
-                sum_risk_exp = np.sum(risk_exp)
+                # --- Compute sum_risk and sum_wX via suffix sums ---
+                stop_order_s = np.argsort(dur_s)
+                sorted_stops_s = dur_s[stop_order_s]
+                risk_by_stop_s = exp_eta_s[stop_order_s]
+                X_by_stop_s = X_s[stop_order_s]
 
-                if sum_risk_exp == 0:
-                    continue
+                wX_stop_s = X_by_stop_s * risk_by_stop_s[:, None]
+                suffix_risk_stop_s = np.empty(n_s + 1)
+                suffix_risk_stop_s[n_s] = 0.0
+                suffix_risk_stop_s[:n_s] = np.cumsum(risk_by_stop_s[::-1])[::-1]
+                suffix_wX_stop_s = np.empty((n_s + 1, p))
+                suffix_wX_stop_s[n_s] = 0.0
+                suffix_wX_stop_s[:n_s] = np.cumsum(wX_stop_s[::-1], axis=0)[::-1]
 
-                if self.tie_method == 'efron' and n_events > 1:
-                    event_exp = exp_eta_s[at_event]
-                    event_X = X_s[at_event]
-                    sum_event_exp = np.sum(event_exp)
+                start_order_s = np.argsort(start_s)
+                sorted_starts_s = start_s[start_order_s]
+                risk_by_start_s = exp_eta_s[start_order_s]
+                X_by_start_s = X_s[start_order_s]
 
-                    for k in range(n_events):
-                        event_idx = event_indices[k]
-                        frac = k / n_events
-                        denom = sum_risk_exp - frac * sum_event_exp
+                wX_start_s = X_by_start_s * risk_by_start_s[:, None]
+                suffix_risk_start_s = np.empty(n_s + 1)
+                suffix_risk_start_s[n_s] = 0.0
+                suffix_risk_start_s[:n_s] = np.cumsum(risk_by_start_s[::-1])[::-1]
+                suffix_wX_start_s = np.empty((n_s + 1, p))
+                suffix_wX_start_s[n_s] = 0.0
+                suffix_wX_start_s[:n_s] = np.cumsum(wX_start_s[::-1], axis=0)[::-1]
 
-                        if denom <= 0:
-                            continue
+                idx_stop_s = np.searchsorted(sorted_stops_s, event_times_s, side='left')
+                idx_start_s = np.searchsorted(sorted_starts_s, event_times_s, side='left')
 
-                        num = (np.sum(risk_X * risk_exp[:, np.newaxis], axis=0) -
-                            frac * np.sum(event_X * event_exp[:, np.newaxis], axis=0))
-                        expected_X = num / denom
+                sum_risk_s = suffix_risk_stop_s[idx_stop_s] - suffix_risk_start_s[idx_start_s]
+                sum_wX_s = suffix_wX_stop_s[idx_stop_s] - suffix_wX_start_s[idx_start_s]
 
-                        # Event contribution
-                        score_contrib = X_s[event_idx] - expected_X
-                        cluster_idx = cluster_to_idx[cluster_s[event_idx]]
-                        score_matrix[cluster_idx] += score_contrib
+                valid_s = sum_risk_s > 0
+                expected_X_all_s = np.zeros((n_event_times_s, p))
+                expected_X_all_s[valid_s] = sum_wX_s[valid_s] / sum_risk_s[valid_s, None]
 
-                        # At-risk contribution (all at risk lose a fraction)
-                        for r_idx in risk_indices:
-                            hazard_contrib = exp_eta_s[r_idx] / denom
-                            at_risk_score = -hazard_contrib * (X_s[r_idx] - expected_X)
-                            c_idx = cluster_to_idx[cluster_s[r_idx]]
-                            score_matrix[c_idx] += at_risk_score
-                else:
-                    expected_X = np.sum(risk_X * risk_exp[:, np.newaxis], axis=0) / sum_risk_exp
+                # Event contributions
+                event_X_s = X_s[event_mask_s]
+                event_exp_X_s = expected_X_all_s[event_time_indices_s]
+                event_scores_s = event_X_s - event_exp_X_s
+                event_clusters_s = cluster_idx_s[event_mask_s]
+                np.add.at(score_matrix, event_clusters_s, event_scores_s)
 
-                    # Event contributions
-                    for event_idx in event_indices:
-                        score_contrib = X_s[event_idx] - expected_X
-                        cluster_idx = cluster_to_idx[cluster_s[event_idx]]
-                        score_matrix[cluster_idx] += score_contrib
+                # At-risk contributions via prefix sums
+                d_over_risk_s = np.zeros(n_event_times_s)
+                d_over_risk_s[valid_s] = d_counts_s[valid_s] / sum_risk_s[valid_s]
 
-                    # At-risk contributions
-                    for r_idx in risk_indices:
-                        hazard_contrib = n_events * exp_eta_s[r_idx] / sum_risk_exp
-                        at_risk_score = -hazard_contrib * (X_s[r_idx] - expected_X)
-                        c_idx = cluster_to_idx[cluster_s[r_idx]]
-                        score_matrix[c_idx] += at_risk_score
+                prefix_d_over_risk_s = np.zeros(n_event_times_s + 1)
+                prefix_d_over_risk_s[1:] = np.cumsum(d_over_risk_s)
+
+                weighted_expX_s = d_over_risk_s[:, None] * expected_X_all_s
+                prefix_weighted_expX_s = np.zeros((n_event_times_s + 1, p))
+                prefix_weighted_expX_s[1:] = np.cumsum(weighted_expX_s, axis=0)
+
+                lower_s = np.searchsorted(event_times_s, start_s, side='right')
+                upper_s = np.searchsorted(event_times_s, dur_s, side='right')
+
+                row_sums_s = prefix_d_over_risk_s[upper_s] - prefix_d_over_risk_s[lower_s]
+                term2_s = prefix_weighted_expX_s[upper_s] - prefix_weighted_expX_s[lower_s]
+
+                at_risk_contribs_s = -exp_eta_s[:, None] * (X_s * row_sums_s[:, None] - term2_s)
+                np.add.at(score_matrix, cluster_idx_s, at_risk_contribs_s)
+            else:
+                # Fallback: loop over event times (for Efron with ties)
+                for t in event_times_s:
+                    at_risk = (start_s < t) & (dur_s >= t)
+                    at_event = (dur_s == t) & (evt_s == 1)
+
+                    if not np.any(at_event):
+                        continue
+
+                    n_events = int(np.sum(at_event))
+                    risk_exp = exp_eta_s[at_risk]
+                    risk_X = X_s[at_risk]
+                    sum_risk_exp = np.sum(risk_exp)
+
+                    if sum_risk_exp == 0:
+                        continue
+
+                    if n_events > 1:
+                        event_exp = exp_eta_s[at_event]
+                        event_X_t = X_s[at_event]
+                        sum_event_exp = np.sum(event_exp)
+                        sum_wX_risk = np.sum(risk_X * risk_exp[:, None], axis=0)
+                        sum_wX_event = np.sum(event_X_t * event_exp[:, None], axis=0)
+
+                        event_indices = np.where(at_event)[0]
+                        risk_cluster_idx = cluster_idx_s[at_risk]
+                        risk_exp_arr = exp_eta_s[at_risk]
+                        risk_X_arr = X_s[at_risk]
+
+                        for k in range(n_events):
+                            frac = k / n_events
+                            denom = sum_risk_exp - frac * sum_event_exp
+                            if denom <= 0:
+                                continue
+
+                            expected_X_k = (sum_wX_risk - frac * sum_wX_event) / denom
+                            event_idx = event_indices[k]
+                            c_idx = cluster_idx_s[event_idx]
+                            score_matrix[c_idx] += X_s[event_idx] - expected_X_k
+
+                            hazard_contribs = risk_exp_arr / denom
+                            at_risk_scores = -hazard_contribs[:, None] * (risk_X_arr - expected_X_k[None, :])
+                            np.add.at(score_matrix, risk_cluster_idx, at_risk_scores)
+                    else:
+                        expected_X_t = np.sum(risk_X * risk_exp[:, None], axis=0) / sum_risk_exp
+
+                        event_cluster_idx = cluster_idx_s[at_event]
+                        event_scores_t = X_s[at_event] - expected_X_t[None, :]
+                        np.add.at(score_matrix, event_cluster_idx, event_scores_t)
+
+                        risk_cluster_idx = cluster_idx_s[at_risk]
+                        hazard_contribs = n_events * exp_eta_s[at_risk] / sum_risk_exp
+                        at_risk_scores = -hazard_contribs[:, None] * (X_s[at_risk] - expected_X_t[None, :])
+                        np.add.at(score_matrix, risk_cluster_idx, at_risk_scores)
 
         B = score_matrix.T @ score_matrix
         robust_var = I_inv @ B @ I_inv

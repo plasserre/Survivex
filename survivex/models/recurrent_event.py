@@ -231,10 +231,12 @@ class PWPTTResult:
 
 class PWPTTModel:
     """PWP Total Time model for recurrent events."""
-    
-    def __init__(self, tie_method: str = 'efron', alpha: float = 0.05):
+
+    def __init__(self, tie_method: str = 'efron', alpha: float = 0.05,
+                 device: str = None):
         self.tie_method = tie_method
         self.alpha = alpha
+        self.device = device
         self._is_fitted = False
         self.cox_model_ = None
         
@@ -273,7 +275,7 @@ class PWPTTModel:
             self.events_per_stratum_[int(s)] = int(np.sum(events[mask]))
 
         # Fit stratified Cox with counting process support
-        self.cox_model_ = StratifiedCoxPHModel(tie_method=self.tie_method)
+        self.cox_model_ = StratifiedCoxPHModel(tie_method=self.tie_method, device=self.device)
         self.cox_model_.fit(X, time_stop, events, stratum, start_times=time_start)
 
         # Robust variance

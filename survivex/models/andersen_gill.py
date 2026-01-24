@@ -134,23 +134,27 @@ class AndersenGillModel:
     counting processes: a large sample study. The Annals of Statistics.
     """
     
-    def __init__(self, 
+    def __init__(self,
                  tie_method: str = 'efron',
-                 alpha: float = 0.05):
+                 alpha: float = 0.05,
+                 device: str = None):
         """
         Initialize Andersen-Gill model.
-        
+
         Parameters:
         -----------
         tie_method : str, default='efron'
             Method for handling tied event times ('efron' or 'breslow')
         alpha : float, default=0.05
             Significance level for confidence intervals
+        device : str, optional
+            Device for computation ('cpu', 'cuda', 'mps')
         """
         self.tie_method = tie_method
         self.alpha = alpha
+        self.device = device
         self._is_fitted = False
-        
+
         # Will store fitted Cox model
         self.cox_model_ = None
         
@@ -240,7 +244,7 @@ class AndersenGillModel:
         self.n_events_ = np.sum(events)
         
         # Fit Cox model with counting process format
-        self.cox_model_ = CoxPHModel(tie_method=self.tie_method, alpha=self.alpha)
+        self.cox_model_ = CoxPHModel(tie_method=self.tie_method, alpha=self.alpha, device=self.device)
         self.cox_model_.fit(
             X=X,
             durations=time_stop,
