@@ -34,4 +34,8 @@ setup(
         "scipy>=1.7.0",
         "matplotlib>=3.4.0",
     ],
+    extras_require={
+        "performance": ["numba>=0.56.0", "joblib>=1.1.0"],
+        "dev": ["pytest>=7.0.0", "pytest-cov>=4.0.0", "lifelines>=0.27.0"],
+    },
 )
