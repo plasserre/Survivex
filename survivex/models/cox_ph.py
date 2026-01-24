@@ -252,27 +252,22 @@ class CoxPHModel:
         self.max_iter = max_iter
         self.tol = tol
 
-        # Device selection
-        # Note: Cox PH is FASTER on CPU due to:
-        # 1. Sequential operations (cumulative sums, Newton-Raphson iterations)
-        # 2. GPU data transfer overhead
-        # 3. Highly optimized numpy/numba on CPU
-        # Default to CPU unless explicitly requested otherwise
+        # Device selection — CPU is default since numpy/numba is fast for typical sizes.
+        # GPU (cuda/mps) can help on large datasets with Breslow method.
         if device is None:
-            device = 'cpu'  # CPU is faster for Cox PH
-        elif device == 'mps':
-            warnings.warn(
-                "MPS device does not support float64 required for Cox model. "
-                "Using CPU instead for numerical stability."
-            )
             device = 'cpu'
+        elif device == 'mps':
+            if not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+                warnings.warn("MPS not available, falling back to CPU.")
+                device = 'cpu'
         elif device == 'cuda':
-            warnings.warn(
-                "Cox PH is typically faster on CPU due to sequential operations. "
-                "Consider using device='cpu' for better performance."
-            )
+            if not torch.cuda.is_available():
+                warnings.warn("CUDA not available, falling back to CPU.")
+                device = 'cpu'
 
         self.device = torch.device(device)
+        # MPS only supports float32; CUDA and CPU use float64
+        self.dtype = torch.float32 if self.device.type == 'mps' else torch.float64
         
         # Model parameters (set after fitting)
         self.coefficients_ = None
@@ -357,7 +352,7 @@ class CoxPHModel:
         self.unsorted_indices_ = torch.argsort(sorted_indices)  # Store unsort mapping
         
         # Initialize coefficients to zero
-        beta = torch.zeros(n_features, device=self.device, dtype=torch.float64)
+        beta = torch.zeros(n_features, device=self.device, dtype=self.dtype)
 
         # Newton-Raphson optimization
         converged = False
@@ -374,7 +369,7 @@ class CoxPHModel:
             # Newton-Raphson step with line search
             try:
                 # Compute Newton direction
-                delta = torch.linalg.solve(hessian, gradient)
+                delta = self._solve(hessian, gradient)
 
                 # Check convergence based on delta norm (like lifelines)
                 # This is more robust than gradient norm for large datasets
@@ -409,7 +404,7 @@ class CoxPHModel:
                 # Hessian is singular, add regularization
                 warnings.warn("Hessian is singular, adding regularization")
                 regularization = torch.eye(n_features, device=self.device) * 1e-6
-                delta = torch.linalg.solve(hessian + regularization, gradient)
+                delta = self._solve(hessian + regularization, gradient)
                 beta = beta - delta
 
         if not converged:
@@ -425,14 +420,14 @@ class CoxPHModel:
         
         # Standard errors from inverse Hessian
         try:
-            hessian_inv = torch.linalg.inv(-final_hessian)
+            hessian_inv = self._inv(-final_hessian)
             # Transform to original scale
             variance_matrix = hessian_inv / (self.X_std_.unsqueeze(1) * self.X_std_.unsqueeze(0))
             standard_errors = torch.sqrt(torch.diag(variance_matrix))
         except RuntimeError:
             warnings.warn("Could not compute standard errors (singular Hessian)")
             standard_errors = torch.full_like(beta_original, float('nan'))
-            variance_matrix = torch.eye(len(beta_original), device=self.device, dtype=torch.float64) * float('nan')
+            variance_matrix = torch.eye(len(beta_original), device=self.device, dtype=self.dtype) * float('nan')
 
         # Store results
         self.coefficients_ = beta_original.cpu().numpy()
@@ -456,6 +451,20 @@ class CoxPHModel:
         
         return self
     
+    def _solve(self, A, b):
+        """Solve Ax=b. Falls back to CPU for MPS which lacks linalg.solve."""
+        if self.device.type == 'mps':
+            x = torch.linalg.solve(A.cpu().double(), b.cpu().double())
+            return x.to(device=self.device, dtype=self.dtype)
+        return torch.linalg.solve(A, b)
+
+    def _inv(self, A):
+        """Matrix inverse. Falls back to CPU for MPS."""
+        if self.device.type == 'mps':
+            result = torch.linalg.inv(A.cpu().double())
+            return result.to(device=self.device, dtype=self.dtype)
+        return torch.linalg.inv(A)
+
     def _compute_derivatives(self,
                         beta: torch.Tensor,
                         X: torch.Tensor,
@@ -478,8 +487,6 @@ class CoxPHModel:
         compute_hessian : bool
             If False, skip Hessian computation (faster for line search).
         """
-        # Always use numpy/Numba for Efron - GPU overhead for loops is prohibitive
-        # Only use GPU for Breslow which is fully vectorized
         if self.device.type == 'cpu' or self.tie_method == 'efron':
             return self._compute_derivatives_numpy(beta, X, durations, events, start_times, compute_hessian)
         else:
@@ -508,6 +515,15 @@ class CoxPHModel:
         events_np = events.cpu().numpy().astype(np.float64)
 
         n_samples, n_features = X_np.shape
+
+        # Check if we have counting process data (non-trivial start times)
+        has_start_times = (start_times is not None and
+                          not torch.all(start_times == 0).item())
+        if has_start_times:
+            start_np = start_times.cpu().numpy().astype(np.float64)
+            return self._compute_derivatives_counting_process(
+                beta_np, X_np, durations_np, events_np, start_np, compute_hessian
+            )
 
         # Compute risk scores: exp(β'X)
         eta = X_np @ beta_np
@@ -651,9 +667,76 @@ class CoxPHModel:
 
         # Convert back to torch
         return (
-            torch.tensor(log_likelihood, device=self.device, dtype=torch.float64),
-            torch.tensor(gradient, device=self.device, dtype=torch.float64),
-            torch.tensor(hessian, device=self.device, dtype=torch.float64)
+            torch.tensor(log_likelihood, device=self.device, dtype=self.dtype),
+            torch.tensor(gradient, device=self.device, dtype=self.dtype),
+            torch.tensor(hessian, device=self.device, dtype=self.dtype)
+        )
+
+    def _compute_derivatives_counting_process(self, beta_np, X_np, durations_np, events_np,
+                                               start_np, compute_hessian=True):
+        """Compute partial likelihood derivatives for counting process (start, stop] data."""
+        n_samples, n_features = X_np.shape
+        eta = X_np @ beta_np
+        risk_scores = np.exp(eta)
+
+        event_mask = events_np == 1
+        unique_event_times = np.unique(durations_np[event_mask])
+
+        log_likelihood = 0.0
+        gradient = np.zeros(n_features)
+        hessian = np.zeros((n_features, n_features))
+
+        for t in unique_event_times:
+            # Risk set: start < t AND stop >= t
+            at_risk = (start_np < t) & (durations_np >= t)
+            at_event = (durations_np == t) & event_mask
+
+            if not np.any(at_event) or not np.any(at_risk):
+                continue
+
+            risk_at_risk = risk_scores[at_risk]
+            X_at_risk = X_np[at_risk]
+            X_events = X_np[at_event]
+            risk_events = risk_scores[at_event]
+            d_t = int(np.sum(at_event))
+
+            sum_risk = np.sum(risk_at_risk)
+            sum_weighted_X = np.sum(X_at_risk * risk_at_risk[:, np.newaxis], axis=0)
+
+            if self.tie_method == 'breslow' or d_t == 1:
+                log_likelihood += np.sum(eta[at_event]) - d_t * np.log(sum_risk)
+                weighted_mean = sum_weighted_X / sum_risk
+                gradient += np.sum(X_events, axis=0) - d_t * weighted_mean
+
+                if compute_hessian:
+                    sum_weighted_XX = np.einsum('ij,ik,i->jk', X_at_risk, X_at_risk, risk_at_risk)
+                    weighted_mean_XX = sum_weighted_XX / sum_risk
+                    hessian -= d_t * (weighted_mean_XX - np.outer(weighted_mean, weighted_mean))
+            else:
+                # Efron
+                sum_risk_events = np.sum(risk_events)
+                sum_weighted_X_events = np.sum(X_events * risk_events[:, np.newaxis], axis=0)
+                log_likelihood += np.sum(eta[at_event])
+
+                if compute_hessian:
+                    sum_weighted_XX = np.einsum('ij,ik,i->jk', X_at_risk, X_at_risk, risk_at_risk)
+                    sum_weighted_XX_events = np.einsum('ij,ik,i->jk', X_events, X_events, risk_events)
+
+                for l in range(d_t):
+                    frac = l / d_t
+                    denom = sum_risk - frac * sum_risk_events
+                    log_likelihood -= np.log(denom)
+                    adj_weighted_X = (sum_weighted_X - frac * sum_weighted_X_events) / denom
+                    gradient += (np.sum(X_events, axis=0) / d_t) - adj_weighted_X
+
+                    if compute_hessian:
+                        adj_XX = (sum_weighted_XX - frac * sum_weighted_XX_events) / denom
+                        hessian -= adj_XX - np.outer(adj_weighted_X, adj_weighted_X)
+
+        return (
+            torch.tensor(log_likelihood, device=self.device, dtype=self.dtype),
+            torch.tensor(gradient, device=self.device, dtype=self.dtype),
+            torch.tensor(hessian, device=self.device, dtype=self.dtype)
         )
 
     def _compute_derivatives_torch(self,
@@ -692,10 +775,10 @@ class CoxPHModel:
             # Tied events share the same risk set denominator
             unique_durs, inverse = torch.unique(durations, return_inverse=True)
             counts = torch.bincount(inverse)
-            first_per_group = torch.zeros(len(unique_durs), dtype=torch.long, device=self.device)
+            first_per_group = torch.zeros(len(unique_durs), dtype=torch.int32, device=self.device)
             if len(counts) > 1:
-                first_per_group[1:] = torch.cumsum(counts[:-1], dim=0)
-            first_of_group = first_per_group[inverse]
+                first_per_group[1:] = torch.cumsum(counts[:-1].int(), dim=0)
+            first_of_group = first_per_group[inverse].long()
 
             risk_cumsum_rev_adj = risk_cumsum_rev[first_of_group]
             weighted_X_cumsum_rev_adj = weighted_X_cumsum_rev[first_of_group]
@@ -715,7 +798,7 @@ class CoxPHModel:
                 outer_mean = weighted_mean_X.unsqueeze(2) * weighted_mean_X.unsqueeze(1)
                 hessian = -torch.sum(weighted_mean_XX - outer_mean, dim=0)
             else:
-                hessian = torch.zeros((n_features, n_features), device=self.device, dtype=torch.float64)
+                hessian = torch.zeros((n_features, n_features), device=self.device, dtype=self.dtype)
 
         else:  # efron
             # Efron - loop over unique times (hard to fully vectorize)
@@ -728,9 +811,9 @@ class CoxPHModel:
                 weighted_XX = X.unsqueeze(2) * X.unsqueeze(1) * risk_scores.unsqueeze(1).unsqueeze(2)
                 weighted_XX_cumsum_rev = torch.flip(torch.cumsum(torch.flip(weighted_XX, [0]), dim=0), [0])
 
-            log_likelihood = torch.tensor(0.0, device=self.device, dtype=torch.float64)
-            gradient = torch.zeros(n_features, device=self.device, dtype=torch.float64)
-            hessian = torch.zeros((n_features, n_features), device=self.device, dtype=torch.float64)
+            log_likelihood = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+            gradient = torch.zeros(n_features, device=self.device, dtype=self.dtype)
+            hessian = torch.zeros((n_features, n_features), device=self.device, dtype=self.dtype)
 
             for t in unique_times:
                 time_mask = durations == t
@@ -764,7 +847,7 @@ class CoxPHModel:
                     weighted_mean_XX = sum_weighted_XX / sum_risk
                     hessian -= weighted_mean_XX - torch.outer(weighted_mean, weighted_mean)
                 else:
-                    l_vals = torch.arange(d_t, device=self.device, dtype=torch.float64)
+                    l_vals = torch.arange(d_t, device=self.device, dtype=self.dtype)
                     fracs = l_vals / d_t
 
                     denoms = sum_risk - fracs * sum_risk_events
@@ -814,10 +897,10 @@ class CoxPHModel:
 
         if n_unique == 0:
             # No events
-            self.timeline_ = torch.tensor([], device=self.device, dtype=torch.float64)
-            self.baseline_hazard_ = torch.tensor([], device=self.device, dtype=torch.float64)
-            self.baseline_cumulative_hazard_ = torch.tensor([], device=self.device, dtype=torch.float64)
-            self.baseline_survival_ = torch.tensor([], device=self.device, dtype=torch.float64)
+            self.timeline_ = torch.tensor([], device=self.device, dtype=self.dtype)
+            self.baseline_hazard_ = torch.tensor([], device=self.device, dtype=self.dtype)
+            self.baseline_cumulative_hazard_ = torch.tensor([], device=self.device, dtype=self.dtype)
+            self.baseline_survival_ = torch.tensor([], device=self.device, dtype=self.dtype)
             return
 
         # Count events at each unique time
@@ -836,8 +919,8 @@ class CoxPHModel:
         baseline_hazard = d_t / sum_risks
 
         # Store as tensors
-        self.timeline_ = torch.tensor(unique_times, device=self.device, dtype=torch.float64)
-        self.baseline_hazard_ = torch.tensor(baseline_hazard, device=self.device, dtype=torch.float64)
+        self.timeline_ = torch.tensor(unique_times, device=self.device, dtype=self.dtype)
+        self.baseline_hazard_ = torch.tensor(baseline_hazard, device=self.device, dtype=self.dtype)
 
         # Cumulative baseline hazard
         self.baseline_cumulative_hazard_ = torch.cumsum(self.baseline_hazard_, dim=0)
@@ -868,7 +951,7 @@ class CoxPHModel:
         X_standardized = (X - self.X_mean_) / self.X_std_
         
         # Use standardized coefficients (stored internally)
-        beta_std = torch.tensor(self.coefficients_, device=self.device, dtype=torch.float64) * self.X_std_
+        beta_std = torch.tensor(self.coefficients_, device=self.device, dtype=self.dtype) * self.X_std_
         
         risk_scores = torch.exp(torch.matmul(X_standardized, beta_std))
         return risk_scores.cpu().numpy()
@@ -899,7 +982,7 @@ class CoxPHModel:
         X_standardized = (X - self.X_mean_) / self.X_std_
         
         # Use standardized coefficients
-        beta_std = torch.tensor(self.coefficients_, device=self.device, dtype=torch.float64) * self.X_std_
+        beta_std = torch.tensor(self.coefficients_, device=self.device, dtype=self.dtype) * self.X_std_
         
         # Compute risk scores
         risk_scores = torch.exp(torch.matmul(X_standardized, beta_std))
@@ -946,7 +1029,7 @@ class CoxPHModel:
         X_standardized = (X - self.X_mean_) / self.X_std_
         
         # Use standardized coefficients
-        beta_std = torch.tensor(self.coefficients_, device=self.device, dtype=torch.float64) * self.X_std_
+        beta_std = torch.tensor(self.coefficients_, device=self.device, dtype=self.dtype) * self.X_std_
         
         # Compute risk scores
         risk_scores = torch.exp(torch.matmul(X_standardized, beta_std))
@@ -966,7 +1049,7 @@ class CoxPHModel:
     
     def _baseline_survival_at_times(self, times: torch.Tensor) -> torch.Tensor:
         """Get baseline survival function at specified times."""
-        survival_at_times = torch.ones_like(times, device=self.device, dtype=torch.float64)
+        survival_at_times = torch.ones_like(times, device=self.device, dtype=self.dtype)
         
         for i, t in enumerate(times):
             mask = self.timeline_ <= t
@@ -978,7 +1061,7 @@ class CoxPHModel:
     
     def _baseline_cumulative_hazard_at_times(self, times: torch.Tensor) -> torch.Tensor:
         """Get baseline cumulative hazard at specified times."""
-        cum_hazard_at_times = torch.zeros_like(times, device=self.device, dtype=torch.float64)
+        cum_hazard_at_times = torch.zeros_like(times, device=self.device, dtype=self.dtype)
         
         for i, t in enumerate(times):
             mask = self.timeline_ <= t
@@ -1124,13 +1207,11 @@ class CoxPHModel:
     def _to_tensor(self, data: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
         """Convert input data to tensor and move to device."""
         if isinstance(data, torch.Tensor):
-            # If already a tensor, convert to float64 and move to device
-            # Handle MPS tensors by moving to CPU first
             if data.device.type == 'mps':
                 data = data.cpu()
-            return data.to(self.device).double()
+            return data.to(device=self.device, dtype=self.dtype)
         else:
-            return torch.tensor(data, device=self.device, dtype=torch.float64)
+            return torch.tensor(data, device=self.device, dtype=self.dtype)
     
     def _validate_input(self, X: torch.Tensor, durations: torch.Tensor, events: torch.Tensor):
         """Validate input data."""
@@ -1326,9 +1407,9 @@ class CoxPHModel:
         
         # Compute risk scores (centered)
         X_centered = X - self.X_mean_.cpu().numpy()
-        beta = torch.tensor(self.coefficients_, device=self.device, dtype=torch.float64)
+        beta = torch.tensor(self.coefficients_, device=self.device, dtype=self.dtype)
         risk_scores = torch.exp(torch.matmul(
-            torch.tensor(X_centered, device=self.device, dtype=torch.float64), 
+            torch.tensor(X_centered, device=self.device, dtype=self.dtype), 
             beta
         )).cpu().numpy()
         
@@ -1389,21 +1470,21 @@ class CoxPHModel:
         n_features = X.shape[1]
         
         # Get standardized coefficients
-        beta_std = torch.tensor(self.coefficients_, device=self.device, dtype=torch.float64) * self.X_std_
+        beta_std = torch.tensor(self.coefficients_, device=self.device, dtype=self.dtype) * self.X_std_
         
         # Compute information matrix (Hessian)
         _, _, hessian = self._compute_derivatives(beta_std, X, durations, events)
         
         # Inverse information matrix
         try:
-            info_inv = torch.linalg.inv(-hessian)
+            info_inv = self._inv(-hessian)
         except RuntimeError:
             warnings.warn("Information matrix is singular, using pseudo-inverse")
             info_inv = torch.linalg.pinv(-hessian)
         
         # Compute score contribution for each observation
         risk_scores = torch.exp(torch.matmul(X, beta_std))
-        score_residuals = torch.zeros((n_samples, n_features), device=self.device, dtype=torch.float64)
+        score_residuals = torch.zeros((n_samples, n_features), device=self.device, dtype=self.dtype)
         
         for i in range(n_samples):
             if events[i] == 0:
@@ -1594,59 +1675,76 @@ class CoxPHModel:
         
         unique_clusters = np.unique(cluster_id)
         n_clusters = len(unique_clusters)
+        cluster_to_idx = {c: i for i, c in enumerate(unique_clusters)}
         score_matrix = np.zeros((n_clusters, p))
-        
+
         event_times = np.unique(durations_sorted[events_sorted == 1])
-        
+
         for t in event_times:
-            # CRITICAL FIX: Use counting process risk set!
             at_risk = (start_times_sorted < t) & (durations_sorted >= t)
             at_event = (durations_sorted == t) & (events_sorted == 1)
-            
+
             if not np.any(at_event):
                 continue
-            
+
             event_indices = np.where(at_event)[0]
+            risk_indices = np.where(at_risk)[0]
             n_events = len(event_indices)
-            
+
             risk_exp = exp_eta[at_risk]
             risk_X = X_centered[at_risk]
             sum_risk_exp = np.sum(risk_exp)
-            
+
             if sum_risk_exp == 0:
                 continue
-            
+
             if self.tie_method == 'efron' and n_events > 1:
                 event_exp = exp_eta[at_event]
                 event_X = X_centered[at_event]
                 sum_event_exp = np.sum(event_exp)
-                
+
                 for k in range(n_events):
                     event_idx = event_indices[k]
                     frac = k / n_events
                     denom = sum_risk_exp - frac * sum_event_exp
-                    
+
                     if denom <= 0:
                         continue
-                    
-                    num = (np.sum(risk_X * risk_exp[:, np.newaxis], axis=0) - 
+
+                    num = (np.sum(risk_X * risk_exp[:, np.newaxis], axis=0) -
                         frac * np.sum(event_X * event_exp[:, np.newaxis], axis=0))
                     expected_X = num / denom
-                    
+
+                    # Event contribution
                     score_contrib = X_centered[event_idx] - expected_X
-                    cluster_idx = np.where(unique_clusters == cluster_id_sorted[event_idx])[0][0]
+                    cluster_idx = cluster_to_idx[cluster_id_sorted[event_idx]]
                     score_matrix[cluster_idx] += score_contrib
+
+                    # At-risk contribution
+                    for r_idx in risk_indices:
+                        hazard_contrib = exp_eta[r_idx] / denom
+                        at_risk_score = -hazard_contrib * (X_centered[r_idx] - expected_X)
+                        c_idx = cluster_to_idx[cluster_id_sorted[r_idx]]
+                        score_matrix[c_idx] += at_risk_score
             else:
                 expected_X = np.sum(risk_X * risk_exp[:, np.newaxis], axis=0) / sum_risk_exp
-                
+
+                # Event contributions
                 for event_idx in event_indices:
                     score_contrib = X_centered[event_idx] - expected_X
-                    cluster_idx = np.where(unique_clusters == cluster_id_sorted[event_idx])[0][0]
+                    cluster_idx = cluster_to_idx[cluster_id_sorted[event_idx]]
                     score_matrix[cluster_idx] += score_contrib
-        
+
+                # At-risk contributions
+                for r_idx in risk_indices:
+                    hazard_contrib = n_events * exp_eta[r_idx] / sum_risk_exp
+                    at_risk_score = -hazard_contrib * (X_centered[r_idx] - expected_X)
+                    c_idx = cluster_to_idx[cluster_id_sorted[r_idx]]
+                    score_matrix[c_idx] += at_risk_score
+
         B = score_matrix.T @ score_matrix
         robust_var = I_inv @ B @ I_inv
-        
+
         return robust_var
     
 
@@ -1702,7 +1800,10 @@ class StratifiedCoxPHModel:
         self.max_iter = max_iter
         self.tol = tol
         self.device = self.base_model.device
-        
+        self.dtype = self.base_model.dtype
+        self._solve = self.base_model._solve
+        self._inv = self.base_model._inv
+
         # Stratification-specific attributes
         self.strata_ = None
         self.unique_strata_ = None
@@ -1717,21 +1818,24 @@ class StratifiedCoxPHModel:
             X: Union[np.ndarray, torch.Tensor],
             durations: Union[np.ndarray, torch.Tensor],
             events: Union[np.ndarray, torch.Tensor],
-            strata: Union[np.ndarray, torch.Tensor]) -> 'StratifiedCoxPHModel':
+            strata: Union[np.ndarray, torch.Tensor],
+            start_times: Optional[Union[np.ndarray, torch.Tensor]] = None) -> 'StratifiedCoxPHModel':
         """
         Fit stratified Cox model.
-        
+
         Parameters:
         -----------
         X : array-like, shape (n_samples, n_features)
             Covariate matrix
         durations : array-like, shape (n_samples,)
-            Time to event or censoring
+            Time to event or censoring (stop time)
         events : array-like, shape (n_samples,)
             Event indicator (1=event, 0=censored)
         strata : array-like, shape (n_samples,)
             Stratum indicator for each observation
-            
+        start_times : array-like, optional
+            Start times for counting process format
+
         Returns:
         --------
         self : StratifiedCoxPHModel
@@ -1748,95 +1852,100 @@ class StratifiedCoxPHModel:
         if len(strata) != n_samples:
             raise ValueError("strata must have same length as X")
         
+        # Handle start_times
+        if start_times is not None:
+            start_times = self.base_model._to_tensor(start_times)
+        self.start_times_ = start_times
+
         # Store strata info
         self.unique_strata_ = torch.unique(strata)
         self.strata_ = strata
-        
-        print(f"Fitting stratified Cox model with {len(self.unique_strata_)} strata")
-        
+
+
         # Standardize covariates
         self.X_mean_ = torch.mean(X, dim=0)
         self.X_std_ = torch.std(X, dim=0)
         self.X_std_[self.X_std_ == 0] = 1.0
         X_standardized = (X - self.X_mean_) / self.X_std_
-        
+
         # Store for later use
         self.X_sorted_ = X_standardized
         self.durations_sorted_ = durations
         self.events_sorted_ = events
         
         # Initialize coefficients
-        beta = torch.zeros(n_features, device=self.device, dtype=torch.float64)
+        beta = torch.zeros(n_features, device=self.device, dtype=self.dtype)
         
         # Newton-Raphson optimization with stratification
         converged = False
         log_likelihood_history = []
         
         for iteration in range(self.max_iter):
-            # Compute derivatives across all strata
             log_lik, gradient, hessian = self._compute_stratified_derivatives(
-                beta, X_standardized, durations, events, strata
+                beta, X_standardized, durations, events, strata, start_times
             )
-            
+
             log_likelihood_history.append(log_lik.item())
-            
+
             # Check convergence
             gradient_norm = torch.norm(gradient)
             if gradient_norm < self.tol:
                 converged = True
                 break
-            
+
             # Newton-Raphson step
             try:
-                delta = torch.linalg.solve(hessian, gradient)
-                
-                # Line search
+                delta = self._solve(hessian, gradient)
+
                 step_size = 1.0
                 beta_new = beta - step_size * delta
                 log_lik_new, _, _ = self._compute_stratified_derivatives(
-                    beta_new, X_standardized, durations, events, strata
+                    beta_new, X_standardized, durations, events, strata, start_times
                 )
-                
+
                 while log_lik_new < log_lik and step_size > 1e-8:
                     step_size *= 0.5
                     beta_new = beta - step_size * delta
                     log_lik_new, _, _ = self._compute_stratified_derivatives(
-                        beta_new, X_standardized, durations, events, strata
+                        beta_new, X_standardized, durations, events, strata, start_times
                     )
-                
+
                 beta = beta_new
-                
+
             except RuntimeError:
                 warnings.warn("Hessian is singular, adding regularization")
                 regularization = torch.eye(n_features, device=self.device) * 1e-6
-                delta = torch.linalg.solve(hessian + regularization, gradient)
+                delta = self._solve(hessian + regularization, gradient)
                 beta = beta - delta
-        
+
         if not converged:
             warnings.warn(f"Optimization did not converge in {self.max_iter} iterations")
-        
+
         # Transform coefficients back
         beta_original = beta / self.X_std_
-        
+
         # Compute final derivatives for standard errors
         final_log_lik, final_gradient, final_hessian = self._compute_stratified_derivatives(
-            beta, X_standardized, durations, events, strata
+            beta, X_standardized, durations, events, strata, start_times
         )
         
         # Standard errors
         try:
-            hessian_inv = torch.linalg.inv(-final_hessian)
+            hessian_inv = self._inv(-final_hessian)
             variance_matrix = hessian_inv / (self.X_std_.unsqueeze(1) * self.X_std_.unsqueeze(0))
             standard_errors = torch.sqrt(torch.diag(variance_matrix))
         except RuntimeError:
             warnings.warn("Could not compute standard errors")
             standard_errors = torch.full_like(beta_original, float('nan'))
-        
+            variance_matrix = None
+
         # Store results
         self.coefficients_ = beta_original.cpu().numpy()
         self.standard_errors_ = standard_errors.cpu().numpy()
+        if variance_matrix is not None:
+            self.variance_covariance_matrix_ = variance_matrix.cpu().numpy()
         self.log_likelihood_ = final_log_lik.item()
-        
+
         # Estimate baseline hazard for each stratum
         self._estimate_stratified_baseline_hazards(beta_original, X, durations, events, strata)
         
@@ -1857,47 +1966,38 @@ class StratifiedCoxPHModel:
                                        X: torch.Tensor,
                                        durations: torch.Tensor,
                                        events: torch.Tensor,
-                                       strata: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Compute log partial likelihood, gradient, and Hessian for stratified model.
-        
-        The partial likelihood is the product over strata:
-        L(β) = ∏_s L_s(β)
-        
-        So log L(β) = Σ_s log L_s(β)
-        
-        And derivatives are sums over strata.
-        """
+                                       strata: torch.Tensor,
+                                       start_times: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute stratified partial likelihood derivatives (sum over strata)."""
         n_features = X.shape[1]
-        
-        total_log_lik = torch.tensor(0.0, device=self.device, dtype=torch.float64)
-        total_gradient = torch.zeros(n_features, device=self.device, dtype=torch.float64)
-        total_hessian = torch.zeros((n_features, n_features), device=self.device, dtype=torch.float64)
-        
-        # Compute derivatives for each stratum
+
+        total_log_lik = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        total_gradient = torch.zeros(n_features, device=self.device, dtype=self.dtype)
+        total_hessian = torch.zeros((n_features, n_features), device=self.device, dtype=self.dtype)
+
         for s in self.unique_strata_:
             stratum_mask = (strata == s)
-            
+
             X_s = X[stratum_mask]
             durations_s = durations[stratum_mask]
             events_s = events[stratum_mask]
-            
-            # Sort within stratum
+            start_times_s = start_times[stratum_mask] if start_times is not None else None
+
+            # Sort within stratum by stop time
             sorted_indices = torch.argsort(durations_s)
             durations_s_sorted = durations_s[sorted_indices]
             events_s_sorted = events_s[sorted_indices]
             X_s_sorted = X_s[sorted_indices]
-            
-            # Compute derivatives for this stratum
+            start_times_s_sorted = start_times_s[sorted_indices] if start_times_s is not None else None
+
             log_lik_s, gradient_s, hessian_s = self.base_model._compute_derivatives(
-                beta, X_s_sorted, durations_s_sorted, events_s_sorted
+                beta, X_s_sorted, durations_s_sorted, events_s_sorted, start_times_s_sorted
             )
-            
-            # Accumulate
+
             total_log_lik += log_lik_s
             total_gradient += gradient_s
             total_hessian += hessian_s
-        
+
         return total_log_lik, total_gradient, total_hessian
     
     def _estimate_stratified_baseline_hazards(self,
@@ -1979,7 +2079,7 @@ class StratifiedCoxPHModel:
         
         # Standardize
         X_standardized = (X - self.X_mean_) / self.X_std_
-        beta_std = torch.tensor(self.coefficients_, device=self.device, dtype=torch.float64) * self.X_std_
+        beta_std = torch.tensor(self.coefficients_, device=self.device, dtype=self.dtype) * self.X_std_
         
         # Compute risk scores
         risk_scores = torch.exp(torch.matmul(X_standardized, beta_std))
@@ -1997,7 +2097,7 @@ class StratifiedCoxPHModel:
             times = self.base_model._to_tensor(times)
         
         n_times = len(times)
-        survival_functions = torch.zeros((n_samples, n_times), device=self.device, dtype=torch.float64)
+        survival_functions = torch.zeros((n_samples, n_times), device=self.device, dtype=self.dtype)
         
         # Predict for each observation using their stratum
         for i in range(n_samples):
@@ -2021,7 +2121,7 @@ class StratifiedCoxPHModel:
         timeline_s = self.timelines_[stratum]
         baseline_surv_s = self.baseline_survivals_[stratum]
         
-        survival_at_times = torch.ones_like(times, device=self.device, dtype=torch.float64)
+        survival_at_times = torch.ones_like(times, device=self.device, dtype=self.dtype)
         
         for i, t in enumerate(times):
             mask = timeline_s <= t
@@ -2124,84 +2224,92 @@ class StratifiedCoxPHModel:
         n_clusters = len(unique_clusters)
         cluster_to_idx = {c: i for i, c in enumerate(unique_clusters)}
         score_matrix = np.zeros((n_clusters, p))
-        
+
+        # Get start_times if available
+        if hasattr(self, 'start_times_') and self.start_times_ is not None:
+            start_times_np = self.start_times_.cpu().numpy()
+        else:
+            start_times_np = np.zeros_like(durations)
+
         # Compute score contributions per cluster, per stratum
         unique_strata = np.unique(strata)
-        
+
         for s in unique_strata:
-            # Get data for this stratum
             stratum_mask = (strata == s)
             X_s = X_centered[stratum_mask]
             dur_s = durations[stratum_mask]
             evt_s = events[stratum_mask]
             exp_eta_s = exp_eta[stratum_mask]
             cluster_s = cluster_id[stratum_mask]
-            
-            # Get event times in this stratum
+            start_s = start_times_np[stratum_mask]
+
             event_times = np.unique(dur_s[evt_s == 1])
-            
+
             for t in event_times:
-                # Risk set and events at time t
-                at_risk = dur_s >= t
+                at_risk = (start_s < t) & (dur_s >= t)
                 at_event = (dur_s == t) & (evt_s == 1)
-                
+
                 if not np.any(at_event):
                     continue
-                
+
                 event_indices = np.where(at_event)[0]
+                risk_indices = np.where(at_risk)[0]
                 n_events = len(event_indices)
-                
-                # Risk set values
+
                 risk_exp = exp_eta_s[at_risk]
                 risk_X = X_s[at_risk]
                 sum_risk_exp = np.sum(risk_exp)
-                
+
                 if sum_risk_exp == 0:
                     continue
-                
-                # Handle ties with Efron approximation if requested
+
                 if self.tie_method == 'efron' and n_events > 1:
                     event_exp = exp_eta_s[at_event]
                     event_X = X_s[at_event]
                     sum_event_exp = np.sum(event_exp)
-                    
+
                     for k in range(n_events):
                         event_idx = event_indices[k]
                         frac = k / n_events
                         denom = sum_risk_exp - frac * sum_event_exp
-                        
+
                         if denom <= 0:
                             continue
-                        
-                        # Expected X in modified risk set (Efron)
-                        num = (np.sum(risk_X * risk_exp[:, np.newaxis], axis=0) - 
+
+                        num = (np.sum(risk_X * risk_exp[:, np.newaxis], axis=0) -
                             frac * np.sum(event_X * event_exp[:, np.newaxis], axis=0))
                         expected_X = num / denom
-                        
-                        # Score contribution
+
+                        # Event contribution
                         score_contrib = X_s[event_idx] - expected_X
-                        
-                        # Add to cluster's score
                         cluster_idx = cluster_to_idx[cluster_s[event_idx]]
                         score_matrix[cluster_idx] += score_contrib
+
+                        # At-risk contribution (all at risk lose a fraction)
+                        for r_idx in risk_indices:
+                            hazard_contrib = exp_eta_s[r_idx] / denom
+                            at_risk_score = -hazard_contrib * (X_s[r_idx] - expected_X)
+                            c_idx = cluster_to_idx[cluster_s[r_idx]]
+                            score_matrix[c_idx] += at_risk_score
                 else:
-                    # Breslow or single event
                     expected_X = np.sum(risk_X * risk_exp[:, np.newaxis], axis=0) / sum_risk_exp
-                    
+
+                    # Event contributions
                     for event_idx in event_indices:
-                        # Score contribution
                         score_contrib = X_s[event_idx] - expected_X
-                        
-                        # Add to cluster's score
                         cluster_idx = cluster_to_idx[cluster_s[event_idx]]
                         score_matrix[cluster_idx] += score_contrib
-        
-        # B matrix (outer product of score contributions)
+
+                    # At-risk contributions
+                    for r_idx in risk_indices:
+                        hazard_contrib = n_events * exp_eta_s[r_idx] / sum_risk_exp
+                        at_risk_score = -hazard_contrib * (X_s[r_idx] - expected_X)
+                        c_idx = cluster_to_idx[cluster_s[r_idx]]
+                        score_matrix[c_idx] += at_risk_score
+
         B = score_matrix.T @ score_matrix
-        
-        # Sandwich estimator: V_robust = I^{-1} B I^{-1}
         robust_var = I_inv @ B @ I_inv
-        
+
         return robust_var
 
 
@@ -2251,13 +2359,16 @@ class TimeVaryingCoxPHModel:
             tol=tol,
             device=device
         )
-        
+
         self.tie_method = tie_method
         self.alpha = alpha
         self.max_iter = max_iter
         self.tol = tol
         self.device = self.base_model.device
-        
+        self.dtype = self.base_model.dtype
+        self._solve = self.base_model._solve
+        self._inv = self.base_model._inv
+
         self._is_fitted = False
     
     def fit(self,
@@ -2357,7 +2468,7 @@ class TimeVaryingCoxPHModel:
         self.starts_sorted_ = starts_sorted
         
         # Initialize coefficients
-        beta = torch.zeros(n_features, device=self.device, dtype=torch.float64)
+        beta = torch.zeros(n_features, device=self.device, dtype=self.dtype)
         
         # Newton-Raphson optimization
         converged = False
@@ -2379,7 +2490,7 @@ class TimeVaryingCoxPHModel:
             
             # Newton-Raphson step
             try:
-                delta = torch.linalg.solve(hessian, gradient)
+                delta = self._solve(hessian, gradient)
                 
                 # Line search
                 step_size = 1.0
@@ -2400,7 +2511,7 @@ class TimeVaryingCoxPHModel:
             except RuntimeError:
                 warnings.warn("Hessian is singular, adding regularization")
                 regularization = torch.eye(n_features, device=self.device) * 1e-6
-                delta = torch.linalg.solve(hessian + regularization, gradient)
+                delta = self._solve(hessian + regularization, gradient)
                 beta = beta - delta
         
         if not converged:
@@ -2416,7 +2527,7 @@ class TimeVaryingCoxPHModel:
         
         # Standard errors
         try:
-            hessian_inv = torch.linalg.inv(-final_hessian)
+            hessian_inv = self._inv(-final_hessian)
             variance_matrix = hessian_inv / (self.X_std_.unsqueeze(1) * self.X_std_.unsqueeze(0))
             standard_errors = torch.sqrt(torch.diag(variance_matrix))
         except RuntimeError:
@@ -2455,9 +2566,9 @@ class TimeVaryingCoxPHModel:
         risk_scores = torch.exp(torch.matmul(X, beta))
         
         # Initialize
-        log_likelihood = torch.tensor(0.0, device=self.device, dtype=torch.float64)
-        gradient = torch.zeros(n_features, device=self.device, dtype=torch.float64)
-        hessian = torch.zeros((n_features, n_features), device=self.device, dtype=torch.float64)
+        log_likelihood = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        gradient = torch.zeros(n_features, device=self.device, dtype=self.dtype)
+        hessian = torch.zeros((n_features, n_features), device=self.device, dtype=self.dtype)
         
         # Find unique event times
         unique_times = torch.unique(durations[events == 1])

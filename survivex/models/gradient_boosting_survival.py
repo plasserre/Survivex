@@ -144,15 +144,17 @@ class GradientBoostingSurvivalAnalysis:
         self.random_state = random_state
         self.verbose = verbose
         
-        # Set device
-        if device == 'mps' and not torch.backends.mps.is_available():
-            warnings.warn("MPS device not available, using CPU")
+        # Device setup — GPU accelerates gradient computation on large datasets
+        if device == 'mps' and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+            warnings.warn("MPS not available, falling back to CPU")
             device = 'cpu'
         elif device == 'cuda' and not torch.cuda.is_available():
-            warnings.warn("CUDA not available, using CPU")
+            warnings.warn("CUDA not available, falling back to CPU")
             device = 'cpu'
-        
+
         self.device = torch.device(device)
+        self.dtype = torch.float32 if self.device.type == 'mps' else torch.float64
+        self._use_gpu = self.device.type in ('cuda', 'mps')
         
         # Set random seed
         if random_state is not None:
@@ -179,47 +181,72 @@ class GradientBoostingSurvivalAnalysis:
         events: Union[np.ndarray, torch.Tensor]
     ) -> 'GradientBoostingSurvivalAnalysis':
         """Fit the gradient boosting model."""
-        # Convert to numpy
+        # Always need numpy for tree building
         if isinstance(X, torch.Tensor):
             X = X.cpu().numpy()
         if isinstance(durations, torch.Tensor):
             durations = durations.cpu().numpy()
         if isinstance(events, torch.Tensor):
             events = events.cpu().numpy()
-        
+
         n_samples, n_features = X.shape
         self.n_features_ = n_features
-        
+
         if self.verbose > 0:
             print(f"Fitting Gradient Boosting Survival Analysis...")
             print(f"  n_estimators: {self.n_estimators}")
             print(f"  learning_rate: {self.learning_rate}")
             print(f"  max_depth: {self.max_depth}")
-        
+
         # Initialize predictions
         F = np.zeros(n_samples)
-        
+
         # Initialize feature importances
         self.feature_importances_ = np.zeros(n_features)
-        
+
         # Pre-compute sort indices for each feature (reused across all trees)
         self._sort_indices = np.empty((n_features, n_samples), dtype=np.intp)
         for f_idx in range(n_features):
             self._sort_indices[f_idx] = np.argsort(X[:, f_idx])
 
-        # Pre-compute duration sort order (used in gradient and loss computation)
+        # Pre-compute duration sort order
         self._duration_order = np.argsort(durations)
         self._durations_sorted = durations[self._duration_order]
         self._events_sorted = events[self._duration_order]
-        # Pre-compute unique duration positions for tie handling
         self._unique_dur_vals, self._unique_dur_first = np.unique(
             self._durations_sorted, return_index=True
         )
 
+        # GPU path: pre-compute tensors on device for gradient computation
+        if self._use_gpu:
+            self._gpu_events_sorted = torch.tensor(
+                self._events_sorted, device=self.device, dtype=self.dtype
+            )
+            self._gpu_duration_order = torch.tensor(
+                self._duration_order, device=self.device, dtype=torch.long
+            )
+            # Build group mapping for tie handling (vectorized, no loops on GPU)
+            n = len(self._durations_sorted)
+            first_idx = self._unique_dur_first
+            group_ids = np.zeros(n, dtype=np.int64)
+            for i in range(len(first_idx)):
+                end = first_idx[i + 1] if i + 1 < len(first_idx) else n
+                group_ids[first_idx[i]:end] = first_idx[i]
+            self._gpu_first_of_group = torch.tensor(group_ids, device=self.device, dtype=torch.long)
+            # Last-of-group for cumulative contribution ties
+            last_ids = np.zeros(n, dtype=np.int64)
+            for i in range(len(first_idx)):
+                end = first_idx[i + 1] if i + 1 < len(first_idx) else n
+                last_ids[first_idx[i]:end] = end - 1
+            self._gpu_last_of_group = torch.tensor(last_ids, device=self.device, dtype=torch.long)
+
         # Boosting iterations
         for m in range(self.n_estimators):
-            # Compute gradients
-            residuals = self._compute_gradients(F, durations, events)
+            # Compute gradients — GPU or CPU path
+            if self._use_gpu:
+                residuals = self._compute_gradients_torch(F)
+            else:
+                residuals = self._compute_gradients(F, durations, events)
 
             # Subsample if needed
             if self.subsample < 1.0:
@@ -234,16 +261,16 @@ class GradientBoostingSurvivalAnalysis:
                 X_sample = X
                 residuals_sample = residuals
 
-            # Fit tree (use pre-sorted indices for full data)
+            # Fit tree (always numpy — recursive structure doesn't benefit from GPU)
             use_presorted = (self.subsample >= 1.0)
             tree = self._fit_regression_tree(X_sample, residuals_sample, use_presorted=use_presorted)
 
             # Make predictions
             tree_predictions = self._predict_tree(tree, X)
-            
+
             # Update model
             F = F + self.learning_rate * tree_predictions
-            
+
             # Store
             self.estimators_.append(tree)
 
@@ -263,15 +290,17 @@ class GradientBoostingSurvivalAnalysis:
                     loss_oob_old = self._compute_loss(F_oob_old, durations[oob_indices], events[oob_indices])
                     loss_oob_new = self._compute_loss(F[oob_indices], durations[oob_indices], events[oob_indices])
                     self.oob_improvement_.append(loss_oob_old - loss_oob_new)
-            
+
             # Verbose
             if self.verbose > 0 and (m + 1) % max(1, self.n_estimators // 10) == 0:
                 if self.train_score_:
                     print(f"  Iteration {m+1}/{self.n_estimators}, Loss: {self.train_score_[-1]:.4f}")
-        
-        # Clean up pre-computed data (not needed after fit)
+
+        # Clean up pre-computed data
         for attr in ('_sort_indices', '_duration_order', '_durations_sorted',
-                     '_events_sorted', '_unique_dur_vals', '_unique_dur_first'):
+                     '_events_sorted', '_unique_dur_vals', '_unique_dur_first',
+                     '_gpu_events_sorted', '_gpu_duration_order',
+                     '_gpu_first_of_group', '_gpu_last_of_group'):
             if hasattr(self, attr):
                 delattr(self, attr)
 
@@ -621,7 +650,45 @@ class GradientBoostingSurvivalAnalysis:
         gradients = np.empty(n)
         gradients[order] = gradients_sorted
         return -gradients
-    
+
+    def _compute_gradients_torch(self, risk_scores: np.ndarray) -> np.ndarray:
+        """GPU-accelerated gradient computation. Same math as numpy version."""
+        n = len(risk_scores)
+
+        # Move risk scores to GPU in sorted duration order
+        rs_sorted = torch.tensor(
+            risk_scores[self._duration_order], device=self.device, dtype=self.dtype
+        )
+
+        # Numerical stability
+        rs_max = rs_sorted.max()
+        exp_risk = torch.exp(rs_sorted - rs_max)
+
+        # Reverse cumsum for risk set sums
+        risk_set_sums = torch.flip(torch.cumsum(torch.flip(exp_risk, [0]), dim=0), [0])
+
+        # Tie handling: all positions in a tied group share the first position's risk set sum
+        risk_set_sums = risk_set_sums[self._gpu_first_of_group]
+
+        # Event contributions
+        event_contributions = torch.where(
+            self._gpu_events_sorted == 1, 1.0 / risk_set_sums,
+            torch.zeros(1, device=self.device, dtype=self.dtype)
+        )
+        cumulative_event_contrib = torch.cumsum(event_contributions, dim=0)
+
+        # Tie handling: all positions in a tied group share the last position's cumulative value
+        cumulative_event_contrib = cumulative_event_contrib[self._gpu_last_of_group]
+
+        # Gradient in sorted order
+        gradients_sorted = exp_risk * cumulative_event_contrib - self._gpu_events_sorted
+
+        # Map back to original order
+        gradients = torch.empty(n, device=self.device, dtype=self.dtype)
+        gradients[self._gpu_duration_order] = gradients_sorted
+
+        return -gradients.cpu().numpy()
+
     def _compute_loss(
         self, risk_scores: np.ndarray, durations: np.ndarray, events: np.ndarray
     ) -> float:

@@ -4,6 +4,8 @@ Implemented from scratch following lifelines and R survival package
 """
 
 import numpy as np
+import torch
+import warnings
 from scipy.optimize import minimize
 from scipy.special import gamma, gammainc, digamma
 import pandas as pd
@@ -12,16 +14,57 @@ from typing import Optional
 
 
 
+def _resolve_device(device):
+    """Resolve device string, check availability."""
+    if device is None or device == 'cpu':
+        return torch.device('cpu')
+    if device == 'mps':
+        if not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+            warnings.warn("MPS not available, falling back to CPU")
+            return torch.device('cpu')
+        return torch.device('mps')
+    if device == 'cuda':
+        if not torch.cuda.is_available():
+            warnings.warn("CUDA not available, falling back to CPU")
+            return torch.device('cpu')
+        return torch.device('cuda')
+    return torch.device(device)
+
+
+def _torch_optimize(loss_fn, init_params, device, max_iter=500, tol=1e-9):
+    """Run L-BFGS optimization on GPU using autograd for gradients."""
+    dtype = torch.float32 if device.type == 'mps' else torch.float64
+    params = torch.tensor(init_params, device=device, dtype=dtype, requires_grad=True)
+    optimizer = torch.optim.LBFGS(
+        [params], max_iter=max_iter, tolerance_grad=tol, tolerance_change=tol,
+        line_search_fn='strong_wolfe'
+    )
+
+    def closure():
+        optimizer.zero_grad()
+        loss = loss_fn(params)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+
+    with torch.no_grad():
+        final_loss = loss_fn(params).item()
+    return params.detach().cpu().numpy(), final_loss
+
+
 class WeibullPHFitter:
     """
     Weibull Proportional Hazards Model
-    
+
     Hazard: h(t|X) = (rho/lambda) * (t/lambda)^(rho-1) * exp(beta' X)
     Survival: S(t|X) = exp(-exp(beta' X) * (t/lambda)^rho)
     """
-    
-    def __init__(self, penalizer: float = 0.0):
+
+    def __init__(self, penalizer: float = 0.0, device: Optional[str] = None):
         self.penalizer = penalizer
+        self.device = _resolve_device(device)
+        self._use_gpu = self.device.type in ('cuda', 'mps')
         self.params_ = None
         self.coef_ = None
         self.rho_ = None
@@ -83,7 +126,7 @@ class WeibullPHFitter:
         T = np.asarray(T).flatten()
         E = np.asarray(E).flatten()
         n = len(T)
-        
+
         if X is None:
             X = np.ones((n, 1))
         else:
@@ -91,9 +134,9 @@ class WeibullPHFitter:
             if X.ndim == 1:
                 X = X.reshape(-1, 1)
             X = np.column_stack([np.ones(n), X])
-        
+
         p = X.shape[1]
-        
+
         # Initialize
         median_time = np.median(T[E == 1]) if np.any(E) else np.median(T)
         initial_params = np.concatenate([
@@ -101,33 +144,58 @@ class WeibullPHFitter:
             [np.log(max(median_time, 1.0))],  # log_lambda
             np.zeros(p)  # beta
         ])
-        
-        # Optimize
-        result = minimize(
-            fun=self._negative_log_likelihood,
-            x0=initial_params,
-            args=(T, E, X),
-            method='BFGS',
-            jac=self._gradient,
-            options={'maxiter': 500}
-        )
-        
+
+        if self._use_gpu:
+            dtype = torch.float32 if self.device.type == 'mps' else torch.float64
+            T_t = torch.tensor(T, device=self.device, dtype=dtype)
+            E_t = torch.tensor(E, device=self.device, dtype=dtype)
+            X_t = torch.tensor(X, device=self.device, dtype=dtype)
+            pen = self.penalizer
+
+            def loss_fn(params):
+                log_rho, log_lambda = params[0], params[1]
+                beta = params[2:]
+                rho = torch.exp(log_rho)
+                lambda_ = torch.exp(log_lambda)
+                eta = X_t @ beta
+                exp_eta = torch.exp(eta)
+                t_over_lambda_rho = torch.pow(T_t / lambda_, rho)
+                log_hazard = log_rho - rho * log_lambda + (rho - 1) * torch.log(T_t) + eta
+                log_survival = -exp_eta * t_over_lambda_rho
+                nll = -torch.sum(E_t * log_hazard + log_survival)
+                if pen > 0:
+                    nll += 0.5 * pen * torch.sum(beta ** 2)
+                return nll
+
+            opt_params, neg_ll = _torch_optimize(loss_fn, initial_params, self.device)
+        else:
+            result = minimize(
+                fun=self._negative_log_likelihood,
+                x0=initial_params,
+                args=(T, E, X),
+                method='BFGS',
+                jac=self._gradient,
+                options={'maxiter': 500}
+            )
+            opt_params = result.x
+            neg_ll = result.fun
+
+            if hasattr(result, 'hess_inv') and result.hess_inv is not None:
+                if isinstance(result.hess_inv, np.ndarray):
+                    self.variance_matrix_ = result.hess_inv
+                else:
+                    self.variance_matrix_ = np.array(
+                        [result.hess_inv @ np.eye(len(result.x))[i]
+                         for i in range(len(result.x))]
+                    ).T
+
         # Extract parameters
-        self.params_ = result.x
-        self.rho_ = np.exp(result.x[0])
-        self.lambda_ = np.exp(result.x[1])
-        self.coef_ = result.x[2:]
-        self.log_likelihood_ = -result.fun
-        
-        if hasattr(result, 'hess_inv') and result.hess_inv is not None:
-            if isinstance(result.hess_inv, np.ndarray):
-                self.variance_matrix_ = result.hess_inv
-            else:
-                self.variance_matrix_ = np.array(
-                    [result.hess_inv @ np.eye(len(result.x))[i] 
-                     for i in range(len(result.x))]
-                ).T
-        
+        self.params_ = opt_params
+        self.rho_ = np.exp(opt_params[0])
+        self.lambda_ = np.exp(opt_params[1])
+        self.coef_ = opt_params[2:]
+        self.log_likelihood_ = -neg_ll
+
         return self
     
     def predict_survival_function(self, X: Optional[np.ndarray] = None, 
@@ -194,16 +262,18 @@ class WeibullPHFitter:
 class WeibullAFTFitter:
     """
     Weibull Accelerated Failure Time Model
-    
+
     Model: log(T) = mu + beta'X + sigma*epsilon
     where epsilon ~ Gumbel(0,1)
-    
+
     Survival: S(t|X) = exp(-(t/exp(mu + beta'X))^(1/sigma))
     Shape: rho = 1/sigma
     """
-    
-    def __init__(self, penalizer: float = 0.0):
+
+    def __init__(self, penalizer: float = 0.0, device: Optional[str] = None):
         self.penalizer = penalizer
+        self.device = _resolve_device(device)
+        self._use_gpu = self.device.type in ('cuda', 'mps')
         self.params_ = None
         self.lambda_params_ = None
         self.rho_ = None
@@ -287,68 +357,95 @@ class WeibullAFTFitter:
         log_sigma_init = np.log(0.7)
         
         initial_params = np.concatenate([[mu_init], beta_init, [log_sigma_init]])
-        
-        # Try multiple methods
-        methods = ['L-BFGS-B', 'BFGS']
-        best_result = None
-        best_nll = np.inf
-        
-        for method in methods:
-            try:
-                if method == 'L-BFGS-B':
-                    bounds = [(None, None)] * (p + 1)
-                    bounds[-1] = (-5, 2)
-                    result = minimize(
-                        fun=self._negative_log_likelihood,
-                        x0=initial_params,
-                        args=(T, E, X),
-                        method=method,
-                        jac=self._gradient,
-                        bounds=bounds,
-                        options={'maxiter': 1000, 'ftol': 1e-9}
-                    )
-                else:
-                    result = minimize(
-                        fun=self._negative_log_likelihood,
-                        x0=initial_params,
-                        args=(T, E, X),
-                        method=method,
-                        jac=self._gradient,
-                        options={'maxiter': 1000}
-                    )
-                
-                if result.fun < best_nll:
-                    best_nll = result.fun
-                    best_result = result
-                    
-                if result.success:
-                    break
-            except:
-                continue
-        
-        result = best_result
-        
-        # Extract parameters
-        self.params_ = result.x
-        self.lambda_params_ = result.x[:-1]
-        sigma = np.exp(result.x[-1])
-        self.rho_ = 1.0 / sigma
-        self.log_likelihood_ = -result.fun
-        
-        if hasattr(result, 'hess_inv') and result.hess_inv is not None:
-            if isinstance(result.hess_inv, np.ndarray):
-                self.variance_matrix_ = result.hess_inv
-            else:
-                try:
-                    self.variance_matrix_ = np.array(
-                        [result.hess_inv @ np.eye(len(result.x))[i] 
-                         for i in range(len(result.x))]
-                    ).T
-                except:
-                    self.variance_matrix_ = np.eye(len(result.x))
+
+        if self._use_gpu:
+            dtype = torch.float32 if self.device.type == 'mps' else torch.float64
+            T_t = torch.tensor(T, device=self.device, dtype=dtype)
+            E_t = torch.tensor(E, device=self.device, dtype=dtype)
+            X_t = torch.tensor(X, device=self.device, dtype=dtype)
+            log_T_t = torch.log(T_t)
+            pen = self.penalizer
+
+            def loss_fn(params):
+                lambda_params = params[:-1]
+                log_sigma = params[-1]
+                sigma = torch.exp(log_sigma)
+                eta = X_t @ lambda_params
+                residual = (log_T_t - eta) / sigma
+                exp_residual = torch.exp(residual)
+                log_pdf = -log_sigma - log_T_t + residual - exp_residual
+                log_survival = -exp_residual
+                nll = -torch.sum(E_t * log_pdf + (1 - E_t) * log_survival)
+                if pen > 0 and len(lambda_params) > 1:
+                    nll += 0.5 * pen * torch.sum(lambda_params[1:] ** 2)
+                return nll
+
+            opt_params, neg_ll = _torch_optimize(loss_fn, initial_params, self.device)
+            self.variance_matrix_ = np.eye(len(opt_params))
         else:
-            self.variance_matrix_ = np.eye(len(result.x))
-        
+            # Try multiple methods
+            methods = ['L-BFGS-B', 'BFGS']
+            best_result = None
+            best_nll = np.inf
+
+            for method in methods:
+                try:
+                    if method == 'L-BFGS-B':
+                        bounds = [(None, None)] * (p + 1)
+                        bounds[-1] = (-5, 2)
+                        result = minimize(
+                            fun=self._negative_log_likelihood,
+                            x0=initial_params,
+                            args=(T, E, X),
+                            method=method,
+                            jac=self._gradient,
+                            bounds=bounds,
+                            options={'maxiter': 1000, 'ftol': 1e-9}
+                        )
+                    else:
+                        result = minimize(
+                            fun=self._negative_log_likelihood,
+                            x0=initial_params,
+                            args=(T, E, X),
+                            method=method,
+                            jac=self._gradient,
+                            options={'maxiter': 1000}
+                        )
+
+                    if result.fun < best_nll:
+                        best_nll = result.fun
+                        best_result = result
+
+                    if result.success:
+                        break
+                except:
+                    continue
+
+            result = best_result
+            opt_params = result.x
+            neg_ll = result.fun
+
+            if hasattr(result, 'hess_inv') and result.hess_inv is not None:
+                if isinstance(result.hess_inv, np.ndarray):
+                    self.variance_matrix_ = result.hess_inv
+                else:
+                    try:
+                        self.variance_matrix_ = np.array(
+                            [result.hess_inv @ np.eye(len(result.x))[i]
+                             for i in range(len(result.x))]
+                        ).T
+                    except:
+                        self.variance_matrix_ = np.eye(len(result.x))
+            else:
+                self.variance_matrix_ = np.eye(len(result.x))
+
+        # Extract parameters
+        self.params_ = opt_params
+        self.lambda_params_ = opt_params[:-1]
+        sigma = np.exp(opt_params[-1])
+        self.rho_ = 1.0 / sigma
+        self.log_likelihood_ = -neg_ll
+
         self._n_covariates = p - 1
         return self
     
@@ -408,16 +505,18 @@ class WeibullAFTFitter:
 class LogNormalAFTFitter:
     """
     Log-Normal Accelerated Failure Time Model
-    
+
     Model: log(T) = mu + beta'X + sigma*epsilon
     where epsilon ~ Normal(0,1)
-    
+
     For log-normal, there's no simple closed form for hazard in PH,
     so AFT is the natural parameterization.
     """
-    
-    def __init__(self, penalizer: float = 0.0):
+
+    def __init__(self, penalizer: float = 0.0, device: Optional[str] = None):
         self.penalizer = penalizer
+        self.device = _resolve_device(device)
+        self._use_gpu = self.device.type in ('cuda', 'mps')
         self.params_ = None
         self.lambda_params_ = None
         self.sigma_ = None
@@ -508,67 +607,96 @@ class LogNormalAFTFitter:
         log_sigma_init = np.log(max(sigma_init, 0.1))
         
         initial_params = np.concatenate([[mu_init], beta_init, [log_sigma_init]])
-        
-        # Optimize
-        methods = ['L-BFGS-B', 'BFGS']
-        best_result = None
-        best_nll = np.inf
-        
-        for method in methods:
-            try:
-                if method == 'L-BFGS-B':
-                    bounds = [(None, None)] * (p + 1)
-                    bounds[-1] = (-5, 2)
-                    result = minimize(
-                        fun=self._negative_log_likelihood,
-                        x0=initial_params,
-                        args=(T, E, X),
-                        method=method,
-                        jac=self._gradient,
-                        bounds=bounds,
-                        options={'maxiter': 1000, 'ftol': 1e-9}
-                    )
-                else:
-                    result = minimize(
-                        fun=self._negative_log_likelihood,
-                        x0=initial_params,
-                        args=(T, E, X),
-                        method=method,
-                        jac=self._gradient,
-                        options={'maxiter': 1000}
-                    )
-                
-                if result.fun < best_nll:
-                    best_nll = result.fun
-                    best_result = result
-                    
-                if result.success:
-                    break
-            except:
-                continue
-        
-        result = best_result
-        
-        # Extract parameters
-        self.params_ = result.x
-        self.lambda_params_ = result.x[:-1]
-        self.sigma_ = np.exp(result.x[-1])
-        self.log_likelihood_ = -result.fun
-        
-        if hasattr(result, 'hess_inv') and result.hess_inv is not None:
-            if isinstance(result.hess_inv, np.ndarray):
-                self.variance_matrix_ = result.hess_inv
-            else:
-                try:
-                    self.variance_matrix_ = np.array(
-                        [result.hess_inv @ np.eye(len(result.x))[i] 
-                         for i in range(len(result.x))]
-                    ).T
-                except:
-                    self.variance_matrix_ = np.eye(len(result.x))
+
+        if self._use_gpu:
+            import math
+            dtype = torch.float32 if self.device.type == 'mps' else torch.float64
+            T_t = torch.tensor(T, device=self.device, dtype=dtype)
+            E_t = torch.tensor(E, device=self.device, dtype=dtype)
+            X_t = torch.tensor(X, device=self.device, dtype=dtype)
+            log_T_t = torch.log(T_t)
+            pen = self.penalizer
+            sqrt2 = math.sqrt(2.0)
+
+            def loss_fn(params):
+                lambda_params = params[:-1]
+                log_sigma = params[-1]
+                sigma = torch.exp(log_sigma)
+                eta = X_t @ lambda_params
+                residual = (log_T_t - eta) / sigma
+                log_pdf = -log_T_t - log_sigma - 0.5 * math.log(2 * math.pi) - 0.5 * residual ** 2
+                # log(1 - Phi(z)) via erf: 1-Phi(z) = 0.5*(1 - erf(z/sqrt2))
+                survival_prob = 0.5 * (1.0 - torch.erf(residual / sqrt2))
+                log_survival = torch.log(survival_prob + 1e-30)
+                nll = -torch.sum(E_t * log_pdf + (1 - E_t) * log_survival)
+                if pen > 0 and len(lambda_params) > 1:
+                    nll += 0.5 * pen * torch.sum(lambda_params[1:] ** 2)
+                return nll
+
+            opt_params, neg_ll = _torch_optimize(loss_fn, initial_params, self.device)
+            self.variance_matrix_ = np.eye(len(opt_params))
         else:
-            self.variance_matrix_ = np.eye(len(result.x))
-        
+            methods = ['L-BFGS-B', 'BFGS']
+            best_result = None
+            best_nll = np.inf
+
+            for method in methods:
+                try:
+                    if method == 'L-BFGS-B':
+                        bounds = [(None, None)] * (p + 1)
+                        bounds[-1] = (-5, 2)
+                        result = minimize(
+                            fun=self._negative_log_likelihood,
+                            x0=initial_params,
+                            args=(T, E, X),
+                            method=method,
+                            jac=self._gradient,
+                            bounds=bounds,
+                            options={'maxiter': 1000, 'ftol': 1e-9}
+                        )
+                    else:
+                        result = minimize(
+                            fun=self._negative_log_likelihood,
+                            x0=initial_params,
+                            args=(T, E, X),
+                            method=method,
+                            jac=self._gradient,
+                            options={'maxiter': 1000}
+                        )
+
+                    if result.fun < best_nll:
+                        best_nll = result.fun
+                        best_result = result
+
+                    if result.success:
+                        break
+                except:
+                    continue
+
+            result = best_result
+            opt_params = result.x
+            neg_ll = result.fun
+
+            if hasattr(result, 'hess_inv') and result.hess_inv is not None:
+                if isinstance(result.hess_inv, np.ndarray):
+                    self.variance_matrix_ = result.hess_inv
+                else:
+                    try:
+                        self.variance_matrix_ = np.array(
+                            [result.hess_inv @ np.eye(len(result.x))[i]
+                             for i in range(len(result.x))]
+                        ).T
+                    except:
+                        self.variance_matrix_ = np.eye(len(result.x))
+            else:
+                self.variance_matrix_ = np.eye(len(result.x))
+
+        # Extract parameters
+        self.params_ = opt_params
+        self.lambda_params_ = opt_params[:-1]
+        self.sigma_ = np.exp(opt_params[-1])
+        self.log_likelihood_ = -neg_ll
+
         self._n_covariates = p - 1
         return self
     
@@ -636,15 +764,17 @@ class LogNormalAFTFitter:
 class LogLogisticAFTFitter:
     """
     Log-Logistic Accelerated Failure Time Model
-    
+
     Model: log(T) = mu + beta'X + sigma*epsilon
     where epsilon follows a standard logistic distribution
-    
+
     Survival: S(t|X) = 1 / (1 + (t/exp(mu+beta'X))^(1/sigma))
     """
-    
-    def __init__(self, penalizer: float = 0.0):
+
+    def __init__(self, penalizer: float = 0.0, device: Optional[str] = None):
         self.penalizer = penalizer
+        self.device = _resolve_device(device)
+        self._use_gpu = self.device.type in ('cuda', 'mps')
         self.params_ = None
         self.lambda_params_ = None
         self.alpha_ = None  # shape parameter (alpha = 1/sigma)
@@ -735,67 +865,93 @@ class LogLogisticAFTFitter:
         log_alpha_init = 0.0  # alpha = 1
         
         initial_params = np.concatenate([[mu_init], beta_init, [log_alpha_init]])
-        
-        # Optimize
-        methods = ['L-BFGS-B', 'BFGS']
-        best_result = None
-        best_nll = np.inf
-        
-        for method in methods:
-            try:
-                if method == 'L-BFGS-B':
-                    bounds = [(None, None)] * (p + 1)
-                    bounds[-1] = (-3, 3)
-                    result = minimize(
-                        fun=self._negative_log_likelihood,
-                        x0=initial_params,
-                        args=(T, E, X),
-                        method=method,
-                        jac=self._gradient,
-                        bounds=bounds,
-                        options={'maxiter': 1000, 'ftol': 1e-9}
-                    )
-                else:
-                    result = minimize(
-                        fun=self._negative_log_likelihood,
-                        x0=initial_params,
-                        args=(T, E, X),
-                        method=method,
-                        jac=self._gradient,
-                        options={'maxiter': 1000}
-                    )
-                
-                if result.fun < best_nll:
-                    best_nll = result.fun
-                    best_result = result
-                    
-                if result.success:
-                    break
-            except:
-                continue
-        
-        result = best_result
-        
-        # Extract parameters
-        self.params_ = result.x
-        self.lambda_params_ = result.x[:-1]
-        self.alpha_ = np.exp(result.x[-1])
-        self.log_likelihood_ = -result.fun
-        
-        if hasattr(result, 'hess_inv') and result.hess_inv is not None:
-            if isinstance(result.hess_inv, np.ndarray):
-                self.variance_matrix_ = result.hess_inv
-            else:
-                try:
-                    self.variance_matrix_ = np.array(
-                        [result.hess_inv @ np.eye(len(result.x))[i] 
-                         for i in range(len(result.x))]
-                    ).T
-                except:
-                    self.variance_matrix_ = np.eye(len(result.x))
+
+        if self._use_gpu:
+            dtype = torch.float32 if self.device.type == 'mps' else torch.float64
+            T_t = torch.tensor(T, device=self.device, dtype=dtype)
+            E_t = torch.tensor(E, device=self.device, dtype=dtype)
+            X_t = torch.tensor(X, device=self.device, dtype=dtype)
+            log_T_t = torch.log(T_t)
+            pen = self.penalizer
+
+            def loss_fn(params):
+                lambda_params = params[:-1]
+                log_alpha = params[-1]
+                alpha = torch.exp(log_alpha)
+                eta = X_t @ lambda_params
+                z = alpha * (log_T_t - eta)
+                exp_z = torch.exp(z)
+                log_pdf = log_alpha - log_T_t + z - 2 * torch.log(1 + exp_z)
+                log_survival = -torch.log(1 + exp_z)
+                nll = -torch.sum(E_t * log_pdf + (1 - E_t) * log_survival)
+                if pen > 0 and len(lambda_params) > 1:
+                    nll += 0.5 * pen * torch.sum(lambda_params[1:] ** 2)
+                return nll
+
+            opt_params, neg_ll = _torch_optimize(loss_fn, initial_params, self.device)
+            self.variance_matrix_ = np.eye(len(opt_params))
         else:
-            self.variance_matrix_ = np.eye(len(result.x))
-        
+            methods = ['L-BFGS-B', 'BFGS']
+            best_result = None
+            best_nll = np.inf
+
+            for method in methods:
+                try:
+                    if method == 'L-BFGS-B':
+                        bounds = [(None, None)] * (p + 1)
+                        bounds[-1] = (-3, 3)
+                        result = minimize(
+                            fun=self._negative_log_likelihood,
+                            x0=initial_params,
+                            args=(T, E, X),
+                            method=method,
+                            jac=self._gradient,
+                            bounds=bounds,
+                            options={'maxiter': 1000, 'ftol': 1e-9}
+                        )
+                    else:
+                        result = minimize(
+                            fun=self._negative_log_likelihood,
+                            x0=initial_params,
+                            args=(T, E, X),
+                            method=method,
+                            jac=self._gradient,
+                            options={'maxiter': 1000}
+                        )
+
+                    if result.fun < best_nll:
+                        best_nll = result.fun
+                        best_result = result
+
+                    if result.success:
+                        break
+                except:
+                    continue
+
+            result = best_result
+            opt_params = result.x
+            neg_ll = result.fun
+
+            if hasattr(result, 'hess_inv') and result.hess_inv is not None:
+                if isinstance(result.hess_inv, np.ndarray):
+                    self.variance_matrix_ = result.hess_inv
+                else:
+                    try:
+                        self.variance_matrix_ = np.array(
+                            [result.hess_inv @ np.eye(len(result.x))[i]
+                             for i in range(len(result.x))]
+                        ).T
+                    except:
+                        self.variance_matrix_ = np.eye(len(result.x))
+            else:
+                self.variance_matrix_ = np.eye(len(result.x))
+
+        # Extract parameters
+        self.params_ = opt_params
+        self.lambda_params_ = opt_params[:-1]
+        self.alpha_ = np.exp(opt_params[-1])
+        self.log_likelihood_ = -neg_ll
+
         self._n_covariates = p - 1
         return self
     
@@ -853,17 +1009,19 @@ Add these classes to the end of parametric_models.py
 class ExponentialFitter:
     """
     Exponential Survival Model (PH parameterization)
-    
+
     Special case of Weibull with rho = 1 (constant hazard)
-    
+
     Hazard: h(t|X) = lambda * exp(beta'X)
     Survival: S(t|X) = exp(-lambda * t * exp(beta'X))
-    
+
     The exponential is memoryless: P(T > s+t | T > s) = P(T > t)
     """
-    
-    def __init__(self, penalizer: float = 0.0):
+
+    def __init__(self, penalizer: float = 0.0, device: Optional[str] = None):
         self.penalizer = penalizer
+        self.device = _resolve_device(device)
+        self._use_gpu = self.device.type in ('cuda', 'mps')
         self.params_ = None
         self.coef_ = None
         self.lambda_ = None
@@ -936,32 +1094,54 @@ class ExponentialFitter:
         beta_init = np.zeros(p)
         
         initial_params = np.concatenate([[log_lambda_init], beta_init])
-        
-        # Optimize
-        result = minimize(
-            fun=self._negative_log_likelihood,
-            x0=initial_params,
-            args=(T, E, X),
-            method='BFGS',
-            jac=self._gradient,
-            options={'maxiter': 500}
-        )
-        
+
+        if self._use_gpu:
+            dtype = torch.float32 if self.device.type == 'mps' else torch.float64
+            T_t = torch.tensor(T, device=self.device, dtype=dtype)
+            E_t = torch.tensor(E, device=self.device, dtype=dtype)
+            X_t = torch.tensor(X, device=self.device, dtype=dtype)
+            pen = self.penalizer
+
+            def loss_fn(params):
+                log_lambda = params[0]
+                beta = params[1:]
+                lambda_ = torch.exp(log_lambda)
+                eta = X_t @ beta
+                log_hazard = log_lambda + eta
+                cum_hazard = lambda_ * T_t * torch.exp(eta)
+                nll = -torch.sum(E_t * log_hazard - cum_hazard)
+                if pen > 0:
+                    nll += 0.5 * pen * torch.sum(beta ** 2)
+                return nll
+
+            opt_params, neg_ll = _torch_optimize(loss_fn, initial_params, self.device)
+        else:
+            result = minimize(
+                fun=self._negative_log_likelihood,
+                x0=initial_params,
+                args=(T, E, X),
+                method='BFGS',
+                jac=self._gradient,
+                options={'maxiter': 500}
+            )
+            opt_params = result.x
+            neg_ll = result.fun
+
+            if hasattr(result, 'hess_inv') and result.hess_inv is not None:
+                if isinstance(result.hess_inv, np.ndarray):
+                    self.variance_matrix_ = result.hess_inv
+                else:
+                    self.variance_matrix_ = np.array(
+                        [result.hess_inv @ np.eye(len(result.x))[i]
+                         for i in range(len(result.x))]
+                    ).T
+
         # Extract parameters
-        self.params_ = result.x
-        self.lambda_ = np.exp(result.x[0])
-        self.coef_ = result.x[1:]
-        self.log_likelihood_ = -result.fun
-        
-        if hasattr(result, 'hess_inv') and result.hess_inv is not None:
-            if isinstance(result.hess_inv, np.ndarray):
-                self.variance_matrix_ = result.hess_inv
-            else:
-                self.variance_matrix_ = np.array(
-                    [result.hess_inv @ np.eye(len(result.x))[i] 
-                     for i in range(len(result.x))]
-                ).T
-        
+        self.params_ = opt_params
+        self.lambda_ = np.exp(opt_params[0])
+        self.coef_ = opt_params[1:]
+        self.log_likelihood_ = -neg_ll
+
         return self
     
     def predict_survival_function(self, X: Optional[np.ndarray] = None, 

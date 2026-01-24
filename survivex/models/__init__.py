@@ -43,6 +43,11 @@ from .survival_tree import SurvivalTree
 from .random_survival_tree import RandomSurvivalForest
 from .gradient_boosting_survival import GradientBoostingSurvivalAnalysis
 
+# Recurrent event models
+from .andersen_gill import AndersenGillModel, AndersenGillResult
+from .recurrent_event import PWPTTModel, PWPTTResult
+from .pwp import PWPGTModel, PWPGTResult
+
 __all__ = [
     # Non-parametric
     'KaplanMeierEstimator',
@@ -81,4 +86,12 @@ __all__ = [
     'SurvivalTree',
     'RandomSurvivalForest',
     'GradientBoostingSurvivalAnalysis',
+
+    # Recurrent event models
+    'AndersenGillModel',
+    'AndersenGillResult',
+    'PWPTTModel',
+    'PWPTTResult',
+    'PWPGTModel',
+    'PWPGTResult',
 ]
