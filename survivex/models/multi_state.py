@@ -554,11 +554,13 @@ class MultiStateAalenJohansen:
         
         for h in range(self.n_states):
             # Number at risk in state h just before time t
-            # These are subjects who: (1) are in state h at this interval, 
+            # These are subjects who: (1) are in state h at this interval,
             # (2) have Tstart < t, (3) have Tstop >= t
+            # NOTE: Count unique subjects, not rows (since there may be multiple
+            # rows per subject for different possible transitions)
             at_risk_mask = (data.from_state == h) & (data.time_start < t) & (data.time_stop >= t)
-            Y_h = np.sum(at_risk_mask)
-            
+            Y_h = len(np.unique(data.subject_id[at_risk_mask]))
+
             if Y_h == 0:
                 continue
             
