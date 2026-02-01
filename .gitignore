@@ -132,3 +132,4 @@ cgd_data.csv
 *.Rdata
 *.rds
 .Rhistory
+claude.md
