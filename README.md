@@ -1,5 +1,9 @@
 # SurviveX
 
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/TaninZeraati/survivex/main?labpath=examples%2Fgetting_started.ipynb)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+
 A GPU-accelerated survival analysis library for Python, built from scratch with PyTorch.
 
 SurviveX provides a complete toolkit for time-to-event analysis — from classical non-parametric estimators to machine learning models — all implemented from the ground up with optional GPU acceleration. Every model is validated against R's `survival` package and Python's `lifelines` to machine precision.

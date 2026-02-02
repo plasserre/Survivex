@@ -132,4 +132,17 @@ cgd_data.csv
 *.Rdata
 *.rds
 .Rhistory
-claude.md
+*.R
+
+
+# Benchmark and validation files (keep locally, don't track)
+benchmark_*.ipynb
+benchmark_*.png
+validate_accuracy.ipynb
+gpu_benchmark_results.png
+
+# Setup scripts
+pre_config.sh
+project_structure_create.sh
+setup_gitignore.sh
+setup_pyprojecttoml.sh
