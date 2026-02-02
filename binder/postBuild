@@ -1,0 +1,9 @@
+#!/bin/bash
+# postBuild script for Binder
+# This runs after requirements are installed
+
+# Install survivex in editable mode
+pip install -e ..
+
+# Verify installation
+python -c "import survivex; print(f'survivex installed successfully')"

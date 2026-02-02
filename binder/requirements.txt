@@ -1,0 +1,23 @@
+# Binder requirements for survivex
+# CPU-only PyTorch to reduce image size (Binder has memory limits)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+
+# Core dependencies
+numpy>=1.21.0
+pandas>=1.3.0
+scipy>=1.7.0
+matplotlib>=3.4.0
+tqdm>=4.60.0
+scikit-learn>=1.0.0
+
+# Performance dependencies
+numba>=0.56.0
+joblib>=1.1.0
+
+# For comparison/validation examples
+lifelines>=0.27.0
+
+# Jupyter for notebooks
+jupyter
+ipywidgets
