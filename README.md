@@ -1,6 +1,6 @@
 # SurviveX
 
-[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/TaninZeraati/survivex/main?labpath=examples%2Fgetting_started.ipynb)
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/plasserre/Survivex/main?labpath=examples%2Fgetting_started.ipynb)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
@@ -27,7 +27,7 @@ SurviveX fills these gaps with:
 
 ```bash
 # From source (recommended for now)
-git clone https://github.com/TaninZeraati/survivex.git
+git clone https://github.com/plasserre/Survivex.git
 cd survivex
 pip install -e .
 
