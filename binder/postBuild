@@ -3,7 +3,7 @@
 # This runs after requirements are installed
 
 # Install survivex in editable mode
-pip install -e ..
+pip install -e "${REPO_DIR}"
 
 # Verify installation
 python -c "import survivex; print(f'survivex installed successfully')"
