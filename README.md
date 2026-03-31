@@ -649,19 +649,6 @@ pytest tests/
 jupyter notebook validate_accuracy.ipynb
 ```
 
-## Citation
-
-If you use SurviveX in your research, please cite:
-
-```bibtex
-@article{zeraati2026survivex,
-  title={SurviveX: A GPU-Accelerated Python Library for Survival Analysis},
-  author={Zeraati, Tanin},
-  journal={SoftwareX},
-  year={2026}
-}
-```
-
 ## License
 
 This project is licensed under the Apache License 2.0 — see the [LICENSE](LICENSE) file for details.
