@@ -13,7 +13,7 @@ import pandas as pd
 import torch
 from typing import Optional
 
-# Import your implementations
+# Import SurviveX implementations
 try:
     from survivex.models.log_rank_test import LogRankTest, logrank_test
     from survivex.models.kaplan_meier import KaplanMeierEstimator
@@ -459,7 +459,7 @@ def run_all_tests():
     print("ALL VALIDATION TESTS COMPLETED!")
     print("="*70)
     print("\nIf all tests show 'EXCELLENT MATCH' or 'PERFECT MATCH',")
-    print("   your Log-Rank test implementation is validated and ready for use!")
+    print("   SurviveX Log-Rank test implementation is validated and ready for use!")
 
 
 if __name__ == "__main__":

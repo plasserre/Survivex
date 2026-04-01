@@ -13,7 +13,7 @@ import pandas as pd
 import torch
 from typing import Optional
 
-# Import your implementations
+# Import SurviveX implementations
 try:
     from survivex.models.nelson_aalen import NelsonAalenEstimator
     from survivex.models.kaplan_meier import KaplanMeierEstimator
@@ -311,7 +311,7 @@ def test_lung_cancer_data():
                 hazard_ours = np.concatenate([[0], na_ours.cumulative_hazard_.cpu().numpy()])
                 
                 ax1.step(times_ours, hazard_ours, where='post', 
-                        linewidth=2, label='Your Implementation', color='darkred')
+                        linewidth=2, label='SurviveX', color='darkred')
                 
                 times_lifelines = na_lifelines.cumulative_hazard_.index.values
                 hazard_lifelines = na_lifelines.cumulative_hazard_.iloc[:, 0].values
@@ -340,7 +340,7 @@ def test_lung_cancer_data():
                 ax2.plot(test_times_plot, differences, color='green', linewidth=1)
                 ax2.axhline(y=0, color='black', linestyle='-', alpha=0.3)
                 ax2.set_xlabel('Time (days)')
-                ax2.set_ylabel('Difference (Yours - Lifelines)')
+                ax2.set_ylabel('Difference (SurviveX - Lifelines)')
                 ax2.set_title('Difference Between Implementations')
                 ax2.grid(True, alpha=0.3)
                 
@@ -472,7 +472,7 @@ def run_all_tests():
     print("ALL NELSON-AALEN VALIDATION TESTS COMPLETED!")
     print("="*70)
     print("\nIf all tests show 'EXCELLENT MATCH' or 'PERFECT MATCH',")
-    print("   your Nelson-Aalen estimator is validated and ready for use!")
+    print("   SurviveX Nelson-Aalen estimator is validated and ready for use!")
 
 
 if __name__ == "__main__":

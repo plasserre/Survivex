@@ -210,16 +210,16 @@ def test_with_known_data():
 
 
 def load_lung_cancer_data():
-    """Load lung cancer data using your loader system."""
+    """Load lung cancer data using the SurviveX loader."""
     print("Loading lung cancer data...")
     
-    # Load from lifelines using your converter
+    # Load from lifelines using survivex converter
     try:
         df_raw = load_from_lifelines('lung', standardize=True)
         print(f"Loaded lung cancer data: {df_raw.shape}")
         print(f"Columns: {list(df_raw.columns)}")
         
-        # Use your loader to prepare survival data
+        # Use survivex loader to prepare survival data
         survival_data = load_survival_dataset(
             df_raw,
             time_col='time',
@@ -236,13 +236,13 @@ def load_lung_cancer_data():
         return df
         
     except Exception as e:
-        print(f"Error with your loader, trying direct lifelines approach: {e}")
+        print(f"Error with SurviveX loader, trying direct lifelines approach: {e}")
         
         # Fallback to direct lifelines loading
         from lifelines.datasets import load_lung
         df_raw = load_lung()
         
-        # Manual preparation to match your expected format
+        # Manual preparation to match SurviveX expected format
         df = df_raw.copy()
         
         # Map status to event (assuming status: 1=censored, 2=event)
@@ -315,8 +315,8 @@ def test_lung_cancer_kaplan_meier():
     print(f"   Number of censored: {len(events) - events.sum()} ({(1-events.mean()):.1%})")
     print(f"   Median follow-up: {np.median(durations):.1f} days")
     
-    # Fit your Kaplan-Meier estimator
-    print(f"\nFitting your Kaplan-Meier estimator...")
+    # Fit survivex Kaplan-Meier estimator
+    print(f"\nFitting survivex Kaplan-Meier estimator...")
     km_ours = KaplanMeierEstimator(device='cpu')
     km_ours.fit(durations, events)
     
@@ -366,7 +366,7 @@ def test_lung_cancer_kaplan_meier():
         
         # Compare median survival times
         print(f"\nMedian survival comparison:")
-        print(f"   Your implementation: {our_median}")
+        print(f"   SurviveX: {our_median}")
         print(f"   Lifelines:          {lifelines_median}")
         
         if our_median is not None and lifelines_median is not None:
@@ -378,7 +378,7 @@ def test_lung_cancer_kaplan_meier():
         print(f"   Maximum difference at any time point: {max_diff:.10f}")
         
         if max_diff < 1e-10:
-            print("   PERFECT MATCH! Your implementation is identical to lifelines.")
+            print("   PERFECT MATCH! SurviveX is identical to lifelines.")
         elif max_diff < 1e-8:
             print(" EXCELLENT! Differences are within numerical precision.")
         elif max_diff < 1e-6:
@@ -415,7 +415,7 @@ def create_comparison_plot(km_ours, km_lifelines, durations):
     plot_survival_ours = np.concatenate([[1.0], survival_ours])
     
     ax1.step(plot_times_ours, plot_survival_ours, where='post', 
-             linewidth=2, label='Your Implementation', color='red', alpha=0.8)
+             linewidth=2, label='SurviveX', color='red', alpha=0.8)
     
     # Get lifelines data
     lifelines_times = km_lifelines.survival_function_.index.values
@@ -437,7 +437,7 @@ def create_comparison_plot(km_ours, km_lifelines, durations):
     
     if our_median:
         ax1.axvline(x=our_median, color='red', linestyle=':', alpha=0.7, 
-                   label=f'Your Median: {our_median:.1f}')
+                   label=f'SurviveX Median: {our_median:.1f}')
         ax1.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
     
     if their_median:
@@ -461,7 +461,7 @@ def create_comparison_plot(km_ours, km_lifelines, durations):
     ax2.plot(test_times, differences, color='green', linewidth=1)
     ax2.axhline(y=0, color='black', linestyle='-', alpha=0.3)
     ax2.set_xlabel('Time (days)')
-    ax2.set_ylabel('Difference (Yours - Lifelines)')
+    ax2.set_ylabel('Difference (SurviveX - Lifelines)')
     ax2.set_title('Difference Between Implementations')
     ax2.grid(True, alpha=0.3)
     
@@ -476,13 +476,17 @@ def create_comparison_plot(km_ours, km_lifelines, durations):
     
     print(f"   ✅ Comparison plot created successfully")
 
-def test_stratified_analysis(df):
+def test_stratified_analysis():
     """
     Test stratified analysis if categorical variables are available.
     """
+    from lifelines.datasets import load_rossi
+    df = load_rossi()
+    df = df.rename(columns={'week': 'time', 'arrest': 'event'})
+
     print(f"\nSTRATIFIED ANALYSIS")
     print("=" * 40)
-    
+
     # Look for categorical variables to stratify by
     categorical_cols = []
     for col in df.columns:
@@ -512,7 +516,7 @@ def test_stratified_analysis(df):
         
         print(f"\n   Group '{group}': {len(group_data)} patients, {events.sum()} events")
         
-        # Fit your KM estimator
+        # Fit SurviveX KM estimator
         km_ours = KaplanMeierEstimator(device='cpu')
         km_ours.fit(durations, events)
         
@@ -525,7 +529,7 @@ def test_stratified_analysis(df):
             km_lifelines.fit(durations, events)
             median_lifelines = km_lifelines.median_survival_time_
             
-            print(f"     Your median: {median_ours}")
+            print(f"     SurviveX median: {median_ours}")
             print(f"     Lifelines median: {median_lifelines}")
             
             if median_ours and median_lifelines:

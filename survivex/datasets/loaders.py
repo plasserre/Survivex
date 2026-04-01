@@ -245,7 +245,9 @@ def _handle_categorical_features(df, feature_cols, handle_categorical, verbose):
                 le = LabelEncoder()
                 # Handle missing values
                 mask = df[col].notna()
-                df.loc[mask, col] = le.fit_transform(df.loc[mask, col])
+                encoded = le.fit_transform(df.loc[mask, col])
+                df[col] = df[col].astype(object)
+                df.loc[mask, col] = encoded
                 df[col] = pd.to_numeric(df[col], errors='coerce')
     
     elif handle_categorical == 'dummy':

@@ -275,13 +275,13 @@ def test_learning_rate_effect():
             learning_rate=lr,
             max_depth=3,
             random_state=42,
-            verbose=0
+            verbose=1
         )
         gb.fit(X, durations, events)
-        
+
         train_c = gb.score(X, durations, events)
         final_loss = gb.train_score_[-1]
-        
+
         print(f"{lr:<20.2f} {train_c:<20.4f} {final_loss:<20.4f}")
     
     print("\n✅ Different learning rates tested")

@@ -54,7 +54,7 @@ print("TEST 2: WEIBULL AFT - NO COVARIATES")
 print("=" * 80)
 
 waft = WeibullAFTFitter()
-waft.fit(T, E, X=None)
+waft.fit(None, T, E)
 
 waft_ll = LifelinesWeibullAFTFitter()
 waft_ll.fit(rossi[['week', 'arrest']], duration_col='week', event_col='arrest')
@@ -85,7 +85,7 @@ covariates = ['age', 'prio']
 X = rossi[covariates].values
 
 waft_cov = WeibullAFTFitter()
-waft_cov.fit(T, E, X)
+waft_cov.fit(X, T, E)
 
 waft_ll_cov = LifelinesWeibullAFTFitter()
 waft_ll_cov.fit(rossi[['week', 'arrest'] + covariates], duration_col='week', event_col='arrest')

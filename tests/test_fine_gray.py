@@ -323,7 +323,7 @@ if (is.list(pred) && length(pred) >= 3) {
     
     if all_pass:
         print("🎉🎉🎉 ALL TESTS PASSED! 🎉🎉🎉")
-        print("\nYour Fine-Gray implementation is:")
+        print("\Survivex Fine-Gray implementation is:")
         print("  ✓ Coefficients match R exactly")
         print("  ✓ Baseline hazard matches R exactly")
         print("  ✓ Predictions match R closely")

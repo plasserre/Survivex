@@ -190,7 +190,7 @@ def load_from_lifelines(dataset_name: str,
         )
     
     # Load the dataset
-    print(f"📚 Loading '{dataset_name}' from lifelines...")
+    print(f"Loading '{dataset_name}' from lifelines...")
     df = dataset_loaders[dataset_name]()
     print(f"   Original shape: {df.shape}")
     print(f"   Original columns: {list(df.columns)}")
@@ -202,7 +202,7 @@ def load_from_lifelines(dataset_name: str,
         # Auto-detect and convert event column
         df, event_col = detect_and_convert_event_column(df)
         
-        print(f"   ✅ Standardized: time='{time_col}', event='{event_col}'")
+        print(f"   Standardized: time='{time_col}', event='{event_col}'")
         
         # Show summary
         event_rate = df['event'].mean()
@@ -224,7 +224,7 @@ def load_from_sksurv(dataset_name: str,
             "scikit-survival not installed. Install with: pip install scikit-survival"
         )
     
-    print(f"📚 Loading '{dataset_name}' from scikit-survival...")
+    print(f"Loading '{dataset_name}' from scikit-survival...")
     
     # Load based on dataset name
     if dataset_name == 'veterans':
