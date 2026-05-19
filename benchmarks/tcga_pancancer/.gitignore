@@ -1,0 +1,4 @@
+# Downloaded raw archive + extracted study directory (re-downloadable)
+data/
+# Benchmark output CSVs (machine-specific; commit only the canonical paper run)
+results/
