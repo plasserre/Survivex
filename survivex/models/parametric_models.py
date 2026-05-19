@@ -121,8 +121,18 @@ class WeibullPHFitter:
         grad = np.concatenate([[d_log_rho], [d_log_lambda], d_beta])
         return -grad
     
-    def fit(self, T: np.ndarray, E: np.ndarray, X: Optional[np.ndarray] = None) -> 'WeibullPHFitter':
-        """Fit model"""
+    def fit(self, X: Optional[np.ndarray], T: np.ndarray, E: np.ndarray) -> 'WeibullPHFitter':
+        """Fit Weibull PH model.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features) or None
+            Covariate matrix. Pass None for an intercept-only (marginal) fit.
+        T : array-like, shape (n_samples,)
+            Duration / survival times.
+        E : array-like, shape (n_samples,)
+            Event indicators (1 = event, 0 = censored).
+        """
         T = np.asarray(T).flatten()
         E = np.asarray(E).flatten()
         n = len(T)
@@ -583,8 +593,18 @@ class LogNormalAFTFitter:
         grad = np.concatenate([d_lambda, [d_log_sigma]])
         return -grad
     
-    def fit(self, T: np.ndarray, E: np.ndarray, X: Optional[np.ndarray] = None) -> 'LogNormalAFTFitter':
-        """Fit model"""
+    def fit(self, X: Optional[np.ndarray], T: np.ndarray, E: np.ndarray) -> 'LogNormalAFTFitter':
+        """Fit Log-Normal AFT model.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features) or None
+            Covariate matrix. Pass None for an intercept-only (marginal) fit.
+        T : array-like, shape (n_samples,)
+            Duration / survival times.
+        E : array-like, shape (n_samples,)
+            Event indicators (1 = event, 0 = censored).
+        """
         T = np.asarray(T).flatten()
         E = np.asarray(E).flatten()
         n = len(T)
@@ -842,8 +862,18 @@ class LogLogisticAFTFitter:
         grad = np.concatenate([d_lambda, [d_log_alpha]])
         return -grad
     
-    def fit(self, T: np.ndarray, E: np.ndarray, X: Optional[np.ndarray] = None) -> 'LogLogisticAFTFitter':
-        """Fit model"""
+    def fit(self, X: Optional[np.ndarray], T: np.ndarray, E: np.ndarray) -> 'LogLogisticAFTFitter':
+        """Fit Log-Logistic AFT model.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features) or None
+            Covariate matrix. Pass None for an intercept-only (marginal) fit.
+        T : array-like, shape (n_samples,)
+            Duration / survival times.
+        E : array-like, shape (n_samples,)
+            Event indicators (1 = event, 0 = censored).
+        """
         T = np.asarray(T).flatten()
         E = np.asarray(E).flatten()
         n = len(T)
@@ -1072,8 +1102,18 @@ class ExponentialFitter:
         grad = np.concatenate([[d_log_lambda], d_beta])
         return -grad
     
-    def fit(self, T: np.ndarray, E: np.ndarray, X: Optional[np.ndarray] = None) -> 'ExponentialFitter':
-        """Fit model"""
+    def fit(self, X: Optional[np.ndarray], T: np.ndarray, E: np.ndarray) -> 'ExponentialFitter':
+        """Fit Exponential model.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features) or None
+            Covariate matrix. Pass None for an intercept-only (marginal) fit.
+        T : array-like, shape (n_samples,)
+            Duration / survival times.
+        E : array-like, shape (n_samples,)
+            Event indicators (1 = event, 0 = censored).
+        """
         T = np.asarray(T).flatten()
         E = np.asarray(E).flatten()
         n = len(T)

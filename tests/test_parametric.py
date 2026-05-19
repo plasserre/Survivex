@@ -25,7 +25,7 @@ T = rossi['week'].values
 E = rossi['arrest'].values
 
 wph = WeibullPHFitter()
-wph.fit(T, E, X=None)
+wph.fit(None, T, E)
 
 wf_ll = WeibullFitter()
 wf_ll.fit(T, E)
@@ -133,7 +133,7 @@ print(f"True parameters: rho={true_rho}, lambda={true_lambda}")
 print(f"Censoring rate: {(1-E_obs.mean())*100:.1f}%")
 
 wph_synth = WeibullPHFitter()
-wph_synth.fit(T_obs, E_obs, X=None)
+wph_synth.fit(None, T_obs, E_obs)
 
 wf_synth = WeibullFitter()
 wf_synth.fit(T_obs, E_obs)
@@ -160,7 +160,7 @@ print("=" * 80)
 
 
 lnaft = LogNormalAFTFitter()
-lnaft.fit(T, E, X=None)
+lnaft.fit(None, T, E)
 
 lnaft_ll = LifelinesLogNormalAFTFitter()
 lnaft_ll.fit(rossi[['week', 'arrest']], duration_col='week', event_col='arrest')
@@ -189,7 +189,7 @@ print("TEST 6: LOG-NORMAL AFT - WITH COVARIATES")
 print("=" * 80)
 
 lnaft_cov = LogNormalAFTFitter()
-lnaft_cov.fit(T, E, X)
+lnaft_cov.fit(X, T, E)
 
 lnaft_ll_cov = LifelinesLogNormalAFTFitter()
 lnaft_ll_cov.fit(rossi[['week', 'arrest'] + covariates], duration_col='week', event_col='arrest')
@@ -224,7 +224,7 @@ print("=" * 80)
 
 
 llaft = LogLogisticAFTFitter()
-llaft.fit(T, E, X=None)
+llaft.fit(None, T, E)
 
 llaft_ll = LifelinesLogLogisticAFTFitter()
 llaft_ll.fit(rossi[['week', 'arrest']], duration_col='week', event_col='arrest')
@@ -252,7 +252,7 @@ print("TEST 8: LOG-LOGISTIC AFT - WITH COVARIATES")
 print("=" * 80)
 
 llaft_cov = LogLogisticAFTFitter()
-llaft_cov.fit(T, E, X)
+llaft_cov.fit(X, T, E)
 
 llaft_ll_cov = LifelinesLogLogisticAFTFitter()
 llaft_ll_cov.fit(rossi[['week', 'arrest'] + covariates], duration_col='week', event_col='arrest')
@@ -302,7 +302,7 @@ T = rossi['week'].values
 E = rossi['arrest'].values
 
 exp_fitter = ExponentialFitter()
-exp_fitter.fit(T, E, X=None)
+exp_fitter.fit(None, T, E)
 
 exp_ll = LifelinesExponentialFitter()
 exp_ll.fit(T, E)
@@ -346,7 +346,7 @@ covariates = ['age', 'prio']
 X = rossi[covariates].values
 
 exp_cov = ExponentialFitter()
-exp_cov.fit(T, E, X)
+exp_cov.fit(X, T, E)
 
 exp_ll_cov = LifelinesExponentialFitter()
 exp_ll_cov.fit(T, E, label='week')
