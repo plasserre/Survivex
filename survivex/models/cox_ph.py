@@ -537,9 +537,15 @@ class CoxPHModel:
         # and contributes -n_events * eta_max to the log-likelihood (applied
         # below). Without the shift, risk_scores overflows for |eta| > ~709
         # during early Newton-Raphson iterations before line-search damping.
+        # The lower clip at -50 prevents underflow to true 0 (and the
+        # ensuing log(0) when the max-eta individual is not in a given
+        # risk set). At convergence with z-scored X the shifted-eta range
+        # is well within [-50, 0] so the clip is inactive; during wild
+        # early iterations the clipped tail contributes at most exp(-50)
+        # ≈ 2e-22 per individual, negligible vs. the at-risk sum.
         eta = X_np @ beta_np
         eta_max = float(np.max(eta)) if eta.size > 0 else 0.0
-        risk_scores = np.exp(eta - eta_max)
+        risk_scores = np.exp(np.clip(eta - eta_max, -50.0, 0.0))
 
         # Reverse cumsum of risk scores
         risk_cumsum_rev = np.cumsum(risk_scores[::-1])[::-1].copy()
@@ -1006,19 +1012,23 @@ class CoxPHModel:
         """
         n_samples, n_features = X.shape
 
-        # Numerical stability: max-shift eta before exp. The Cox partial
-        # likelihood is invariant to a constant shift in eta (the constant
-        # cancels in the ratios that form the gradient and Hessian), so we
-        # subtract eta_max before exp to keep risk_scores in (0, 1] and add
-        # -n_events * eta_max to the log-likelihood (applied below). In
-        # float32 on GPU, torch.exp(eta) overflows silently to inf for
-        # eta > ~88, then propagates as nan through cumsums.
+        # Numerical stability: max-shift eta before exp, then clip the
+        # negative tail. The Cox partial likelihood is invariant to a
+        # constant shift in eta (the constant cancels in the ratios that
+        # form the gradient and Hessian), so we subtract eta_max before
+        # exp to keep risk_scores in (0, 1] and add -n_events * eta_max
+        # to the log-likelihood (applied below). In float32 on GPU,
+        # torch.exp(eta) overflows silently to inf for eta > ~88 and
+        # underflows to 0 for eta < ~-87; the [-50, 0] clip keeps
+        # risk_scores in [exp(-50), 1] ≈ [2e-22, 1], inactive at
+        # convergence (z-scored X with reasonable β yields shifted-eta
+        # well within ±10) but stabilising wild early Newton steps.
         eta = torch.matmul(X, beta)
         if eta.numel() > 0:
             eta_max = torch.amax(eta).detach()
         else:
             eta_max = torch.zeros((), device=self.device, dtype=self.dtype)
-        risk_scores = torch.exp(eta - eta_max)
+        risk_scores = torch.exp(torch.clamp(eta - eta_max, min=-50.0, max=0.0))
 
         # Reverse cumsum of risk scores
         risk_cumsum_rev = torch.flip(torch.cumsum(torch.flip(risk_scores, [0]), dim=0), [0])
@@ -2324,6 +2334,20 @@ class StratifiedCoxPHModel:
             )
 
             log_likelihood_history.append(log_lik.item())
+
+            # Relative log-likelihood change convergence. Catches plateaus
+            # where neither the gradient-norm nor the delta-norm criteria
+            # trigger — common in high-p Cox PH with correlated covariates
+            # (e.g., gene expression). This is the criterion used by
+            # lifelines and R's survival::coxph; without it, Newton can
+            # iterate to max_iter at a numerical fixed point while the
+            # raw gradient norm never quite reaches 1e-6.
+            if iteration > 0:
+                prev = log_likelihood_history[-2]
+                rel_change = abs(log_lik.item() - prev) / max(abs(prev), 1.0)
+                if rel_change < self.tol:
+                    converged = True
+                    break
 
             # Check convergence (gradient norm or delta norm)
             gradient_norm = torch.norm(gradient)
