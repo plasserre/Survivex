@@ -131,7 +131,7 @@ def _bench_survivex(
         # is essentially unstratified for the warm-up).
         n_wu = min(400, n)
         try:
-            wu = StratifiedCoxPHModel(tie_method="breslow", device=device)
+            wu = StratifiedCoxPHModel(tie_method="breslow", device=device, max_iter=200)
             wu.fit(X[:n_wu], T[:n_wu], E[:n_wu], strata[:n_wu])
             del wu
         except Exception:
@@ -150,7 +150,7 @@ def _bench_survivex(
         torch.mps.synchronize()
     t0 = time.perf_counter()
 
-    cox = StratifiedCoxPHModel(tie_method="breslow", device=device)
+    cox = StratifiedCoxPHModel(tie_method="breslow", device=device, max_iter=200)
     err = ""
     notes: list[str] = []
     try:

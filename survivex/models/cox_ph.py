@@ -531,9 +531,15 @@ class CoxPHModel:
                 beta_np, X_np, durations_np, events_np, start_np, compute_hessian
             )
 
-        # Compute risk scores: exp(β'X)
+        # Numerical stability: max-shift eta before exp. The Cox partial
+        # likelihood is invariant to a constant shift in eta: the constant
+        # cancels in the ratios of cumsums that form the gradient and Hessian,
+        # and contributes -n_events * eta_max to the log-likelihood (applied
+        # below). Without the shift, risk_scores overflows for |eta| > ~709
+        # during early Newton-Raphson iterations before line-search damping.
         eta = X_np @ beta_np
-        risk_scores = np.exp(eta)
+        eta_max = float(np.max(eta)) if eta.size > 0 else 0.0
+        risk_scores = np.exp(eta - eta_max)
 
         # Reverse cumsum of risk scores
         risk_cumsum_rev = np.cumsum(risk_scores[::-1])[::-1].copy()
@@ -568,8 +574,12 @@ class CoxPHModel:
                 if weighted_XX_cumsum_rev is not None:
                     weighted_XX_cumsum_rev = weighted_XX_cumsum_rev[first_of_group]
 
-            # Vectorized Breslow (also exact when no ties)
-            log_likelihood = np.sum(eta[event_mask] - np.log(risk_cumsum_rev[event_mask]))
+            # Vectorized Breslow (also exact when no ties).
+            # Correction term for the max-shift applied to risk_scores above.
+            log_likelihood = (
+                np.sum(eta[event_mask] - np.log(risk_cumsum_rev[event_mask]))
+                - int(event_mask.sum()) * eta_max
+            )
             weighted_mean_X = weighted_X_cumsum_rev[event_mask] / risk_cumsum_rev[event_mask, np.newaxis]
             gradient = np.sum(X_np[event_mask] - weighted_mean_X, axis=0)
 
@@ -622,6 +632,8 @@ class CoxPHModel:
                     risk_scores, risk_cumsum_rev, weighted_X_cumsum_rev, weighted_XX_cumsum_rev,
                     unique_times, time_to_first_idx, event_indices_flat, event_indices_starts, event_indices_counts
                 )
+                # Correction term for the max-shift applied to risk_scores above.
+                log_likelihood -= int(event_mask.sum()) * eta_max
             else:
                 # Fallback: optimized numpy implementation
                 log_likelihood = 0.0
@@ -670,6 +682,9 @@ class CoxPHModel:
                         adj_weighted_XX_all = (sum_weighted_XX - fracs[:, np.newaxis, np.newaxis] * sum_weighted_XX_events) / denoms[:, np.newaxis, np.newaxis]
                         outer_all = adj_weighted_X_all[:, :, np.newaxis] * adj_weighted_X_all[:, np.newaxis, :]
                         hessian -= np.sum(adj_weighted_XX_all - outer_all, axis=0)
+
+                # Correction term for the max-shift applied to risk_scores above.
+                log_likelihood -= int(event_mask.sum()) * eta_max
 
         # Convert back to torch
         return (
@@ -991,9 +1006,19 @@ class CoxPHModel:
         """
         n_samples, n_features = X.shape
 
-        # Compute risk scores: exp(β'X)
+        # Numerical stability: max-shift eta before exp. The Cox partial
+        # likelihood is invariant to a constant shift in eta (the constant
+        # cancels in the ratios that form the gradient and Hessian), so we
+        # subtract eta_max before exp to keep risk_scores in (0, 1] and add
+        # -n_events * eta_max to the log-likelihood (applied below). In
+        # float32 on GPU, torch.exp(eta) overflows silently to inf for
+        # eta > ~88, then propagates as nan through cumsums.
         eta = torch.matmul(X, beta)
-        risk_scores = torch.exp(eta)
+        if eta.numel() > 0:
+            eta_max = torch.amax(eta).detach()
+        else:
+            eta_max = torch.zeros((), device=self.device, dtype=self.dtype)
+        risk_scores = torch.exp(eta - eta_max)
 
         # Reverse cumsum of risk scores
         risk_cumsum_rev = torch.flip(torch.cumsum(torch.flip(risk_scores, [0]), dim=0), [0])
@@ -1023,7 +1048,11 @@ class CoxPHModel:
             risk_cumsum_rev_adj = risk_cumsum_rev[first_of_group]
             weighted_X_cumsum_rev_adj = weighted_X_cumsum_rev[first_of_group]
 
-            log_likelihood = torch.sum(eta[event_mask] - torch.log(risk_cumsum_rev_adj[event_mask]))
+            # Correction term for the max-shift applied to risk_scores above.
+            log_likelihood = (
+                torch.sum(eta[event_mask] - torch.log(risk_cumsum_rev_adj[event_mask]))
+                - int(event_mask.sum().item()) * eta_max
+            )
             weighted_mean_X = weighted_X_cumsum_rev_adj[event_mask] / risk_cumsum_rev_adj[event_mask].unsqueeze(1)
             gradient = torch.sum(X[event_mask] - weighted_mean_X, dim=0)
 
@@ -1100,6 +1129,9 @@ class CoxPHModel:
                     adj_weighted_XX_all = (sum_weighted_XX.unsqueeze(0) - fracs.unsqueeze(1).unsqueeze(2) * sum_weighted_XX_events.unsqueeze(0)) / denoms.unsqueeze(1).unsqueeze(2)
                     outer_all = adj_weighted_X_all.unsqueeze(2) * adj_weighted_X_all.unsqueeze(1)
                     hessian -= torch.sum(adj_weighted_XX_all - outer_all, dim=0)
+
+            # Correction term for the max-shift applied to risk_scores above.
+            log_likelihood = log_likelihood - int(event_mask.sum().item()) * eta_max
 
         return log_likelihood, gradient, hessian
     
