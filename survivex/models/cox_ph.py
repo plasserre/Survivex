@@ -554,13 +554,12 @@ class CoxPHModel:
         weighted_X = X_np * risk_scores[:, np.newaxis]
         weighted_X_cumsum_rev = np.cumsum(weighted_X[::-1], axis=0)[::-1].copy()
 
-        # For Hessian: reverse cumsum of X_j X_j^T * exp(β'X_j) - EXPENSIVE
-        # Only compute if needed (skip during line search)
-        if compute_hessian:
-            weighted_XX = X_np[:, :, np.newaxis] * X_np[:, np.newaxis, :] * risk_scores[:, np.newaxis, np.newaxis]
-            weighted_XX_cumsum_rev = np.cumsum(weighted_XX[::-1], axis=0)[::-1].copy()
-        else:
-            weighted_XX_cumsum_rev = None
+        # The Hessian for Breslow is computed in the branch below WITHOUT
+        # materialising the (N, p, p) weighted_XX tensor — see the reformulation
+        # note in that block. We leave weighted_XX_cumsum_rev = None here and
+        # let the Efron branch allocate it lazily if needed (Efron with ties
+        # still needs the per-event tensor).
+        weighted_XX_cumsum_rev = None
 
         # Check for ties
         event_mask = events_np == 1
@@ -570,15 +569,22 @@ class CoxPHModel:
         has_ties = max_ties > 1
 
         if self.tie_method == 'breslow' or not has_ties:
-            # Breslow: tied events share the same risk set denominator
+            # Breslow: tied events share the same risk set denominator.
+            # We also need last_of_group for the Hessian's w-cumsum below:
+            # tied samples must all see the cumsum value AFTER every event
+            # at their shared time has been included.
             if has_ties and self.tie_method == 'breslow':
                 unique_durs, first_indices = np.unique(durations_np, return_index=True)
                 group_idx = np.searchsorted(unique_durs, durations_np)
                 first_of_group = first_indices[group_idx]
                 risk_cumsum_rev = risk_cumsum_rev[first_of_group]
                 weighted_X_cumsum_rev = weighted_X_cumsum_rev[first_of_group]
-                if weighted_XX_cumsum_rev is not None:
-                    weighted_XX_cumsum_rev = weighted_XX_cumsum_rev[first_of_group]
+                last_indices = np.empty_like(first_indices)
+                last_indices[:-1] = first_indices[1:] - 1
+                last_indices[-1] = n_samples - 1
+                last_of_group = last_indices[group_idx]
+            else:
+                last_of_group = None  # each sample is its own group; no promotion needed
 
             # Vectorized Breslow (also exact when no ties).
             # Correction term for the max-shift applied to risk_scores above.
@@ -590,10 +596,28 @@ class CoxPHModel:
             gradient = np.sum(X_np[event_mask] - weighted_mean_X, axis=0)
 
             if compute_hessian:
-                risk_at_events = risk_cumsum_rev[event_mask, np.newaxis, np.newaxis]
-                weighted_mean_XX = weighted_XX_cumsum_rev[event_mask] / risk_at_events
-                outer_mean = weighted_mean_X[:, :, np.newaxis] * weighted_mean_X[:, np.newaxis, :]
-                hessian = -np.sum(weighted_mean_XX - outer_mean, axis=0)
+                # Hessian reformulation: swap the order of summation in
+                # Σ_events ΣXX/r_cum to collapse it into a single matmul,
+                # avoiding the O(N·p²) tensor materialisation.
+                #
+                # Σ_i∈events (1/r_cum_i) Σ_j∈R(t_i) r_j X_j X_j'
+                #     = Σ_j r_j X_j X_j' · w_j
+                #     = X' diag(r·w) X
+                # where w_j = Σ_{i∈events: t_i ≤ t_j} 1/r_cum_i.
+                #
+                # Σ_events outer(mean_X, mean_X) = M'M where M = mean_X[events].
+                # Total: H = M'M − X' diag(d) X with d = r·w. This is the
+                # algebraic identity, valid for both no-ties and Breslow ties
+                # (with last_of_group promotion of w so tied samples share
+                # the same denominator contribution). Memory drops from
+                # O(N·p²) to O(p²) at the same FLOP count.
+                event_contribs = event_mask.astype(np.float64) / risk_cumsum_rev
+                w_partial = np.cumsum(event_contribs)
+                w = w_partial if last_of_group is None else w_partial[last_of_group]
+                d = risk_scores * w
+                XdX = X_np.T @ (X_np * d[:, np.newaxis])
+                MM = weighted_mean_X.T @ weighted_mean_X
+                hessian = MM - XdX
             else:
                 hessian = np.zeros((n_features, n_features))
 
@@ -1037,23 +1061,27 @@ class CoxPHModel:
         weighted_X = X * risk_scores.unsqueeze(1)
         weighted_X_cumsum_rev = torch.flip(torch.cumsum(torch.flip(weighted_X, [0]), dim=0), [0])
 
-        # For Hessian: reverse cumsum of X_j X_j^T * exp(β'X_j) - EXPENSIVE
-        if compute_hessian:
-            weighted_XX = X.unsqueeze(2) * X.unsqueeze(1) * risk_scores.unsqueeze(1).unsqueeze(2)
-            weighted_XX_cumsum_rev = torch.flip(torch.cumsum(torch.flip(weighted_XX, [0]), dim=0), [0])
-        else:
-            weighted_XX_cumsum_rev = None
+        # The Hessian for Breslow is computed in the branch below WITHOUT
+        # materialising the (N, p, p) weighted_XX tensor (see reformulation
+        # note in that block). Efron still needs it and allocates lazily.
+        weighted_XX_cumsum_rev = None
 
         if self.tie_method == 'breslow':
             event_mask = events == 1
 
-            # Tied events share the same risk set denominator
+            # Tied events share the same risk set denominator. last_of_group
+            # is needed for the Hessian reformulation below to promote the
+            # w-cumsum so tied samples share the same denominator contribution.
             unique_durs, inverse = torch.unique(durations, return_inverse=True)
             counts = torch.bincount(inverse)
             first_per_group = torch.zeros(len(unique_durs), dtype=torch.int32, device=self.device)
             if len(counts) > 1:
                 first_per_group[1:] = torch.cumsum(counts[:-1].int(), dim=0)
             first_of_group = first_per_group[inverse].long()
+            last_per_group = torch.zeros(len(unique_durs), dtype=torch.int32, device=self.device)
+            last_per_group[:-1] = first_per_group[1:] - 1
+            last_per_group[-1] = n_samples - 1
+            last_of_group = last_per_group[inverse].long()
 
             risk_cumsum_rev_adj = risk_cumsum_rev[first_of_group]
             weighted_X_cumsum_rev_adj = weighted_X_cumsum_rev[first_of_group]
@@ -1067,15 +1095,19 @@ class CoxPHModel:
             gradient = torch.sum(X[event_mask] - weighted_mean_X, dim=0)
 
             if compute_hessian:
-                if weighted_XX_cumsum_rev is not None:
-                    weighted_XX_cumsum_rev_adj = weighted_XX_cumsum_rev[first_of_group]
-                else:
-                    weighted_XX = X.unsqueeze(2) * X.unsqueeze(1) * risk_scores.unsqueeze(1).unsqueeze(2)
-                    weighted_XX_cumsum_rev_adj = torch.flip(torch.cumsum(torch.flip(weighted_XX, [0]), dim=0), [0])[first_of_group]
-                risk_at_events = risk_cumsum_rev_adj[event_mask].unsqueeze(1).unsqueeze(2)
-                weighted_mean_XX = weighted_XX_cumsum_rev_adj[event_mask] / risk_at_events
-                outer_mean = weighted_mean_X.unsqueeze(2) * weighted_mean_X.unsqueeze(1)
-                hessian = -torch.sum(weighted_mean_XX - outer_mean, dim=0)
+                # Hessian reformulation (see numpy path for full derivation):
+                #   H = M'M − X' diag(d) X with d = r·w and
+                #   w_j = Σ_{events i: t_i ≤ t_j} 1/r_cum_i (promoted by
+                #   last_of_group for ties so tied samples share the same
+                #   denominator). Memory: O(p²) vs the O(N·p²) of the
+                #   materialised weighted_XX cumsum.
+                event_contribs = event_mask.to(self.dtype) / risk_cumsum_rev_adj
+                w_partial = torch.cumsum(event_contribs, dim=0)
+                w = w_partial[last_of_group]
+                d = risk_scores * w
+                XdX = X.T @ (X * d.unsqueeze(1))
+                MM = weighted_mean_X.T @ weighted_mean_X
+                hessian = MM - XdX
             else:
                 hessian = torch.zeros((n_features, n_features), device=self.device, dtype=self.dtype)
 
