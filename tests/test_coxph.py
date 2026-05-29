@@ -548,20 +548,77 @@ def test_predictions():
         return None
 
 
+def test_ridge_penalty():
+    """
+    Validate L2 (Ridge) regularization against lifelines.
+
+    Our `penalty=X` follows the lifelines convention (effective penalty
+    n * penalty * 0.5 * ||β||^2), so `CoxPHModel(penalty=X)` and
+    `CoxPHFitter(penalizer=X, l1_ratio=0)` should agree to machine
+    precision when both use the same tie method (Efron).
+    """
+    print("\n" + "="*70)
+    print("Ridge (L2) Penalty Validation vs lifelines")
+    print("="*70)
+
+    try:
+        from lifelines.datasets import load_rossi
+        from lifelines import CoxPHFitter
+        import warnings
+    except ImportError:
+        print("lifelines not available")
+        return None
+
+    rossi = load_rossi()
+    T = rossi['week'].values.astype(np.float64)
+    E = rossi['arrest'].values.astype(np.float64)
+    X = rossi.drop(columns=['week', 'arrest']).values.astype(np.float64)
+
+    all_ok = True
+    for lam in [0.001, 0.01, 0.1, 1.0]:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cf = CoxPHFitter(penalizer=lam, l1_ratio=0.0)
+            cf.fit(rossi, duration_col='week', event_col='arrest')
+            beta_lf = cf.params_.values
+
+            m = CoxPHModel(tie_method='efron', penalty=lam, max_iter=200, tol=1e-9)
+            m.fit(X, T, E)
+            beta_sx = m.coefficients_
+
+        diff = float(np.max(np.abs(beta_sx - beta_lf)))
+        rel = diff / max(float(np.max(np.abs(beta_lf))), 1e-12)
+        # Tolerance: machine precision for matched solvers. Loose enough to
+        # absorb tiny differences in line-search step-halving; tight enough
+        # to catch any scaling-factor regression on the n*penalizer term.
+        ok = diff < 1e-4
+        status = "OK" if ok else "FAIL"
+        print(f"  penalty={lam:6.3f}  max|diff|={diff:.3e}  rel={rel:.3e}  [{status}]")
+        all_ok = all_ok and ok
+
+    if all_ok:
+        print("\n[PASS] Ridge penalty matches lifelines penalizer convention")
+        return True
+    else:
+        print("\n[FAIL] Ridge penalty does NOT match lifelines (check n-scaling)")
+        return False
+
+
 def run_all_tests():
     """Run all validation tests."""
     print("\n" + "*"*70)
     print("COX PROPORTIONAL HAZARDS MODEL - COMPREHENSIVE VALIDATION")
     print("*"*70)
-    
+
     results = {}
-    
+
     # Run tests
     results['simple'] = test_simple_example()
     results['rossi'] = test_rossi_dataset()
     results['lung'] = test_lung_cancer()
     results['ties'] = test_tie_methods()
     results['predictions'] = test_predictions()
+    results['ridge'] = test_ridge_penalty()
     
     # Summary
     print("\n" + "="*70)

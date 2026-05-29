@@ -89,7 +89,7 @@ def _peak_gpu_mb(device: str) -> float:
 
 def _bench_survivex(
     X: np.ndarray, T: np.ndarray, E: np.ndarray, strata: np.ndarray,
-    device: str, p: int, seed: int, warmup: bool,
+    device: str, p: int, seed: int, warmup: bool, penalty: float = 0.0,
 ) -> tuple[BenchmarkRow, Optional[object]]:
     """Fit survivex StratifiedCoxPHModel on the requested device."""
     import torch
@@ -131,7 +131,8 @@ def _bench_survivex(
         # is essentially unstratified for the warm-up).
         n_wu = min(400, n)
         try:
-            wu = StratifiedCoxPHModel(tie_method="breslow", device=device, max_iter=200)
+            wu = StratifiedCoxPHModel(tie_method="breslow", device=device,
+                                      max_iter=200, penalty=penalty)
             wu.fit(X[:n_wu], T[:n_wu], E[:n_wu], strata[:n_wu])
             del wu
         except Exception:
@@ -150,7 +151,8 @@ def _bench_survivex(
         torch.mps.synchronize()
     t0 = time.perf_counter()
 
-    cox = StratifiedCoxPHModel(tie_method="breslow", device=device, max_iter=200)
+    cox = StratifiedCoxPHModel(tie_method="breslow", device=device,
+                               max_iter=200, penalty=penalty)
     err = ""
     notes: list[str] = []
     try:
@@ -194,7 +196,7 @@ def _bench_survivex(
 
 def _bench_lifelines(
     X: np.ndarray, T: np.ndarray, E: np.ndarray, strata: np.ndarray,
-    strata_labels: np.ndarray, p: int, seed: int,
+    strata_labels: np.ndarray, p: int, seed: int, penalty: float = 0.0,
 ) -> BenchmarkRow:
     """Lifelines CoxPHFitter with strata for a fair comparison."""
     n_strata = int(len(np.unique(strata)))
@@ -223,7 +225,8 @@ def _bench_lifelines(
     gc.collect()
     tracemalloc.start()
     t0 = time.perf_counter()
-    cph = CoxPHFitter(penalizer=0.0)
+    # l1_ratio=0 → pure Ridge (matches survivex penalty convention exactly).
+    cph = CoxPHFitter(penalizer=penalty, l1_ratio=0.0)
     err = ""
     notes = ""
     try:
@@ -337,6 +340,15 @@ def main() -> int:
         "--no-warmup", action="store_true",
         help="Skip the GPU warm-up fit. Default is to warm up.",
     )
+    parser.add_argument(
+        "--penalty", type=float, default=0.0,
+        help="L2 Ridge penalty (lifelines convention: effective penalty is "
+             "n*penalty*0.5*||beta||^2). Same value is passed to survivex "
+             "and lifelines so coefficients are directly comparable. "
+             "Default 0.0 (unregularised). Recommend 0.01 for p>=2000 "
+             "where unregularised Cox is ill-posed (lifelines crashes; "
+             "see its own ConvergenceError at high p).",
+    )
     args = parser.parse_args()
 
     processed_dir = args.data_dir / "processed"
@@ -355,6 +367,7 @@ def main() -> int:
              f"cuda={cuda_avail} ({cuda_name}); mps={mps_avail}")
     except ImportError:
         _log("torch not available; GPU backends will be skipped")
+    _log(f"penalty (L2 Ridge, lifelines convention) = {args.penalty}")
 
     for p in sorted(set(args.p)):
         _log(f"== p = {p} ==")
@@ -373,7 +386,7 @@ def main() -> int:
             if "survivex-cpu" in args.backends:
                 row, obj = _bench_survivex(
                     X, T, E, strata, device="cpu", p=p, seed=seed,
-                    warmup=not args.no_warmup,
+                    warmup=not args.no_warmup, penalty=args.penalty,
                 )
                 cox_cpu_obj = obj
                 rows.append(row)
@@ -383,7 +396,7 @@ def main() -> int:
             if "survivex-cuda" in args.backends:
                 row, obj = _bench_survivex(
                     X, T, E, strata, device="cuda", p=p, seed=seed,
-                    warmup=not args.no_warmup,
+                    warmup=not args.no_warmup, penalty=args.penalty,
                 )
                 cox_gpu_obj = obj
                 rows.append(row)
@@ -394,7 +407,7 @@ def main() -> int:
             if "survivex-mps" in args.backends:
                 row, obj = _bench_survivex(
                     X, T, E, strata, device="mps", p=p, seed=seed,
-                    warmup=not args.no_warmup,
+                    warmup=not args.no_warmup, penalty=args.penalty,
                 )
                 if cox_gpu_obj is None:
                     cox_gpu_obj = obj
@@ -404,7 +417,7 @@ def main() -> int:
 
             if "lifelines-cpu" in args.backends:
                 row = _bench_lifelines(X, T, E, strata, strata_labels,
-                                       p=p, seed=seed)
+                                       p=p, seed=seed, penalty=args.penalty)
                 rows.append(row)
                 _log(f"    lifelines-cpu: {row.fit_seconds:.3f}s "
                      f"c-index={row.c_index:.4f}  err={row.error or '-'}")

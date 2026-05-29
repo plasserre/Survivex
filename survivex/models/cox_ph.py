@@ -218,15 +218,16 @@ class CoxPHModel:
     - lifelines: CoxPHFitter
     """
     
-    def __init__(self, 
+    def __init__(self,
                  tie_method: str = 'efron',
                  alpha: float = 0.05,
                  max_iter: int = 50,
                  tol: float = 1e-6,
+                 penalty: float = 0.0,
                  device: Optional[str] = None):
         """
         Initialize Cox Proportional Hazards model.
-        
+
         Parameters:
         -----------
         tie_method : str, default='efron'
@@ -239,6 +240,19 @@ class CoxPHModel:
             Maximum iterations for Newton-Raphson
         tol : float, default=1e-6
             Convergence tolerance (gradient norm)
+        penalty : float, default=0.0
+            L2 (Ridge) regularization strength applied to the standardised
+            coefficients during optimisation. The penalised objective is
+            ℓ_pen(β) = ℓ_partial(β) − (n · penalty / 2) · ||β||², where
+            n is the number of samples. The factor of n matches the
+            convention used by lifelines's `CoxPHFitter(penalizer=…,
+            l1_ratio=0)`, so `survivex.CoxPHModel(penalty=X)` and
+            `lifelines.CoxPHFitter(penalizer=X, l1_ratio=0)` produce
+            identical coefficients (to numerical precision) on the same
+            data. Setting penalty > 0 is recommended when p > n_events
+            (e.g. high-dimensional gene-expression data) where the
+            unregularised partial likelihood becomes ill-posed.
+            Default 0.0 preserves the unregularised behaviour.
         device : str, optional
             Device for computation ('cpu', 'cuda', 'mps')
             Note: Cox model requires float64 precision. MPS does not support
@@ -246,11 +260,14 @@ class CoxPHModel:
         """
         if tie_method not in ['efron', 'breslow']:
             raise ValueError("tie_method must be 'efron' or 'breslow'")
-        
+        if penalty < 0:
+            raise ValueError("penalty must be non-negative (Ridge strength)")
+
         self.tie_method = tie_method
         self.alpha = alpha
         self.max_iter = max_iter
         self.tol = tol
+        self.penalty = float(penalty)
 
         # Device selection — CPU is default since numpy/numba is fast for typical sizes.
         # GPU (cuda/mps) can help on large datasets with Breslow method.
@@ -358,11 +375,30 @@ class CoxPHModel:
         converged = False
         log_likelihood_history = []
 
+        # Ridge penalty pre-scaled by n_samples to match lifelines convention
+        # (lifelines applies n * penalizer * 0.5 * ||β||² as the penalty;
+        # see CoxPHFitter line ~1476). Setting our self.penalty=X then
+        # behaves identically to lifelines penalizer=X.
+        _penalty_scale = self.penalty * n_samples if self.penalty > 0 else 0.0
+        _penalty_eye = (
+            _penalty_scale * torch.eye(n_features, device=self.device, dtype=self.dtype)
+            if _penalty_scale > 0 else None
+        )
+
         for iteration in range(self.max_iter):
             # Compute log-likelihood, gradient, and Hessian
             log_lik, gradient, hessian = self._compute_derivatives(
                 beta, X_sorted, durations_sorted, events_sorted, start_times_sorted
             )
+
+            # Ridge penalty: ℓ_pen = ℓ − (n·λ/2)||β||², ∇ℓ_pen = ∇ℓ − (n·λ)β,
+            # ∇²ℓ_pen = ∇²ℓ − (n·λ)I. Applied here (not inside
+            # _compute_derivatives) so the penalty appears once per Newton
+            # step, not once per stratum.
+            if _penalty_eye is not None:
+                log_lik = log_lik - 0.5 * _penalty_scale * torch.sum(beta * beta)
+                gradient = gradient - _penalty_scale * beta
+                hessian = hessian - _penalty_eye
 
             log_likelihood_history.append(log_lik.item())
 
@@ -386,6 +422,8 @@ class CoxPHModel:
                     beta_new, X_sorted, durations_sorted, events_sorted, start_times_sorted,
                     compute_hessian=False
                 )
+                if _penalty_eye is not None:
+                    log_lik_new = log_lik_new - 0.5 * _penalty_scale * torch.sum(beta_new * beta_new)
 
                 # Backtracking line search with relative tolerance
                 # Use relative comparison to handle floating point precision at optimum
@@ -397,6 +435,8 @@ class CoxPHModel:
                         beta_new, X_sorted, durations_sorted, events_sorted, start_times_sorted,
                         compute_hessian=False
                     )
+                    if _penalty_eye is not None:
+                        log_lik_new = log_lik_new - 0.5 * _penalty_scale * torch.sum(beta_new * beta_new)
 
                 beta = beta_new
 
@@ -409,14 +449,18 @@ class CoxPHModel:
 
         if not converged:
             warnings.warn(f"Optimization did not converge in {self.max_iter} iterations")
-        
+
         # Transform coefficients back to original scale
         beta_original = beta / self.X_std_
-        
+
         # Compute final derivatives for standard errors
         final_log_lik, final_gradient, final_hessian = self._compute_derivatives(
             beta, X_sorted, durations_sorted, events_sorted, start_times_sorted
         )
+        if _penalty_eye is not None:
+            final_log_lik = final_log_lik - 0.5 * _penalty_scale * torch.sum(beta * beta)
+            final_gradient = final_gradient - _penalty_scale * beta
+            final_hessian = final_hessian - _penalty_eye
         
         # Standard errors from inverse Hessian
         try:
@@ -2261,24 +2305,32 @@ class StratifiedCoxPHModel:
                  alpha: float = 0.05,
                  max_iter: int = 50,
                  tol: float = 1e-6,
+                 penalty: float = 0.0,
                  device: Optional[str] = None):
         """
         Initialize Stratified Cox model.
-        
-        Parameters same as CoxPHModel.
+
+        Parameters same as CoxPHModel. The `penalty` parameter applies
+        L2 (Ridge) regularisation on the shared coefficient vector β
+        (a single penalty across all strata), matching the standard
+        stratified Cox PH convention. Recommended when p > n_events.
         """
+        if penalty < 0:
+            raise ValueError("penalty must be non-negative (Ridge strength)")
         self.base_model = CoxPHModel(
             tie_method=tie_method,
             alpha=alpha,
             max_iter=max_iter,
             tol=tol,
+            penalty=penalty,
             device=device
         )
-        
+
         self.tie_method = tie_method
         self.alpha = alpha
         self.max_iter = max_iter
         self.tol = tol
+        self.penalty = float(penalty)
         self.device = self.base_model.device
         self.dtype = self.base_model.dtype
         self._solve = self.base_model._solve
@@ -2355,15 +2407,33 @@ class StratifiedCoxPHModel:
         
         # Initialize coefficients
         beta = torch.zeros(n_features, device=self.device, dtype=self.dtype)
-        
+
         # Newton-Raphson optimization with stratification
         converged = False
         log_likelihood_history = []
-        
+
+        # Ridge penalty pre-scaled by n_samples (total across strata) to
+        # match lifelines convention: CoxPHFitter(penalizer=X, strata=…)
+        # also multiplies by n. So our self.penalty=X matches lifelines
+        # penalizer=X on the same stratified data. Applied at the OUTER
+        # level so it contributes once per Newton step, not once per stratum.
+        _penalty_scale = self.penalty * n_samples if self.penalty > 0 else 0.0
+        _penalty_eye = (
+            _penalty_scale * torch.eye(n_features, device=self.device, dtype=self.dtype)
+            if _penalty_scale > 0 else None
+        )
+
         for iteration in range(self.max_iter):
             log_lik, gradient, hessian = self._compute_stratified_derivatives(
                 beta, X_standardized, durations, events, strata, start_times
             )
+
+            # Ridge penalty: ℓ_pen = ℓ − (n·λ/2)||β||², applied once across
+            # the full stratified objective.
+            if _penalty_eye is not None:
+                log_lik = log_lik - 0.5 * _penalty_scale * torch.sum(beta * beta)
+                gradient = gradient - _penalty_scale * beta
+                hessian = hessian - _penalty_eye
 
             log_likelihood_history.append(log_lik.item())
 
@@ -2396,6 +2466,8 @@ class StratifiedCoxPHModel:
                 log_lik_new, _, _ = self._compute_stratified_derivatives(
                     beta_new, X_standardized, durations, events, strata, start_times
                 )
+                if _penalty_eye is not None:
+                    log_lik_new = log_lik_new - 0.5 * _penalty_scale * torch.sum(beta_new * beta_new)
 
                 while log_lik_new < log_lik and step_size > 1e-8:
                     step_size *= 0.5
@@ -2403,6 +2475,8 @@ class StratifiedCoxPHModel:
                     log_lik_new, _, _ = self._compute_stratified_derivatives(
                         beta_new, X_standardized, durations, events, strata, start_times
                     )
+                    if _penalty_eye is not None:
+                        log_lik_new = log_lik_new - 0.5 * _penalty_scale * torch.sum(beta_new * beta_new)
 
                 # Check delta-norm convergence (parameter change)
                 delta_norm = torch.norm(step_size * delta)
@@ -2427,7 +2501,11 @@ class StratifiedCoxPHModel:
         final_log_lik, final_gradient, final_hessian = self._compute_stratified_derivatives(
             beta, X_standardized, durations, events, strata, start_times
         )
-        
+        if _penalty_eye is not None:
+            final_log_lik = final_log_lik - 0.5 * _penalty_scale * torch.sum(beta * beta)
+            final_gradient = final_gradient - _penalty_scale * beta
+            final_hessian = final_hessian - _penalty_eye
+
         # Standard errors
         try:
             hessian_inv = self._inv(-final_hessian)
