@@ -586,9 +586,14 @@ All models validated against reference implementations (12/12 tests pass):
 | Andersen-Gill | R survival | 3.61e-08 |
 | PWP Total Time | R survival | 5.55e-16 |
 | PWP Gap Time | R survival | 2.22e-16 |
-| Frailty (Gamma) | R survival | 3.59e-02* |
+| Frailty (Gamma) | frailtyEM (EM) | 3.55e-03* |
 
-*Frailty model uses EM algorithm which may converge to slightly different optimum than R's penalized likelihood.
+*survivex and `frailtyEM::emfrail` both fit the gamma frailty by EM on the exact
+marginal likelihood, and agree to ~1e-4 on the frailty variance (rats, kidney).
+The larger ~3e-2 difference against R `survival::coxph(... + frailty(gamma))` is
+the EM-vs-penalized-partial-likelihood estimator difference — `coxph` maximizes
+a different (approximate) objective — not a survivex defect. Reproduce with
+`tests/validate_frailty_vs_R.py`.
 
 See `validate_accuracy.ipynb` for the full validation notebook.
 

@@ -633,11 +633,27 @@ class FrailtyModel:
     def _m_step_theta(self, frailties: np.ndarray, posterior_info: dict) -> float:
         """M-step: update frailty variance parameter."""
         if self.distribution == 'gamma':
+            from scipy.special import digamma
+            from scipy.optimize import brentq
+
+            # Maximize E[complete-data log-lik] over a = 1/theta for the prior
+            # z ~ Gamma(a, a). The stationary condition is the digamma score
+            #   log(a) - psi(a) = mean(E[z]) - mean(E[log z]) - 1 =: c,
+            # with E[z_i] = shape_i/rate_i and E[log z_i] = psi(shape_i) - log(rate_i).
             shapes = posterior_info['shapes']
             rates = posterior_info['rates']
-            Ez2 = shapes * (shapes + 1) / rates**2
-            Ez = shapes / rates
-            theta_new = np.mean(Ez2 - 2*Ez + 1)
+            Ez = np.mean(shapes / rates)
+            Elogz = np.mean(digamma(shapes) - np.log(rates))
+            c = Ez - Elogz - 1.0
+
+            # log(a) - psi(a) is positive and strictly decreasing, -> 0 as a -> inf.
+            # c <= 0 means the data want vanishing frailty variance (a -> inf).
+            if c <= 1e-12:
+                a = 1e6
+            else:
+                a = brentq(lambda a: np.log(a) - digamma(a) - c,
+                           1e-8, 1e8, xtol=1e-13, rtol=1e-14)
+            theta_new = 1.0 / a
         else:
             log_z_modes = posterior_info['log_z_modes']
             post_variances = posterior_info['post_variances']
