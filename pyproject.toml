@@ -49,6 +49,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "lifelines>=0.27.0",
+    "scikit-learn>=1.0.0",
 ]
 all = [
     "numba>=0.56.0",
@@ -56,6 +57,7 @@ all = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "lifelines>=0.27.0",
+    "scikit-learn>=1.0.0",
 ]
 
 [project.urls]
