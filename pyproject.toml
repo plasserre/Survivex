@@ -62,6 +62,16 @@ all = [
 Homepage = "https://github.com/TaninZeraati/survivex"
 Repository = "https://github.com/TaninZeraati/survivex"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Many legacy tests print results and `return` the fitted model instead of
+# asserting; pytest>=8 warns about the non-None return. Silence that one class
+# so CI logs stay readable. These remain smoke/integration tests; the rigorous
+# numerical gold-standard checks live in tests/validate_*_vs_R.py (nightly tier).
+filterwarnings = [
+    "ignore::pytest.PytestReturnNotNoneWarning",
+]
+
 [tool.setuptools]
 # Explicitly include all packages
 packages = ["survivex", "survivex.models", "survivex.core", "survivex.datasets", "survivex.utils", "survivex.visualization"]

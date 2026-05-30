@@ -1,0 +1,3 @@
+# Benchmark output CSVs (machine-specific; commit only the canonical paper run)
+results/
+__pycache__/

@@ -643,8 +643,9 @@ def run_extended_tests():
         print("\n*** Most extended tests passed - Implementation is excellent ***")
     else:
         print("\n*** Some extended tests failed - Review implementation ***")
-    
+
     print("="*70)
+    return total > 0 and passed == total
 
 
 if __name__ == "__main__":

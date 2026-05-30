@@ -1,151 +1,47 @@
-mkdir -p .github/workflows
-
-cat > .github/workflows/ci.yml << 'EOF'
 name: CI
+
+# Fast tier: runs on every push / PR. Pure-Python smoke + integration tests
+# (no R). Tests that shell out to R auto-skip via tests/conftest.py when no R
+# interpreter is present, so this tier needs only Python + lifelines.
+#
+# The rigorous numerical gold-standard checks against R (machine-epsilon Cox,
+# gamma-frailty EM, recurrent events) run in the nightly slow tier; see
+# .github/workflows/validation.yml and REPRODUCIBILITY.md.
 
 on:
   push:
     branches: [ main, develop ]
   pull_request:
     branches: [ main ]
-  schedule:
-    # Run tests weekly on Sunday at 00:00 UTC
-    - cron: '0 0 * * 0'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
+    name: pytest (${{ matrix.os }} / py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
-        
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ matrix.python-version }}
-        
-    - name: Cache pip packages
-      uses: actions/cache@v3
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
-        
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e .[dev]
-        
-    - name: Lint with flake8
-      run: |
-        # Stop the build if there are Python syntax errors or undefined names
-        flake8 survivex tests --count --select=E9,F63,F7,F82 --show-source --statistics
-        # Exit-zero treats all errors as warnings
-        flake8 survivex tests --count --exit-zero --max-complexity=10 --max-line-length=100 --statistics
-        
-    - name: Check formatting with black
-      run: |
-        black --check survivex tests examples
-        
-    - name: Check import sorting with isort
-      run: |
-        isort --check-only survivex tests examples
-        
-    - name: Type check with mypy
-      run: |
-        mypy survivex
-        
-    - name: Test with pytest
-      run: |
-        pytest tests/ -v --cov=survivex --cov-report=xml --cov-report=term-missing
-        
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
-      with:
-        file: ./coverage.xml
-        flags: unittests
-        name: codecov-umbrella
-        fail_ci_if_error: false
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12"]
 
-  test-gpu:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.10"
-        
-    - name: Install dependencies with GPU support
-      run: |
-        python -m pip install --upgrade pip
-        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-        pip install -e .[dev]
-        
-    - name: Test GPU code paths (CPU fallback)
-      run: |
-        pytest tests/ -v -m "gpu" --cov=survivex --cov-append
+      - uses: actions/checkout@v4
 
-  docs:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.10"
-        
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e .[dev]
-        
-    - name: Build documentation
-      run: |
-        cd docs
-        make html
-        
-    - name: Upload docs artifacts
-      uses: actions/upload-artifact@v3
-      with:
-        name: documentation
-        path: docs/_build/html/
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
 
-  benchmark:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.10"
-        
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e .[dev,benchmark]
-        
-    - name: Run benchmarks
-      run: |
-        pytest tests/benchmarks/ -v --benchmark-only --benchmark-json=benchmark.json
-        
-    - name: Upload benchmark results
-      uses: actions/upload-artifact@v3
-      with:
-        name: benchmark-results
-        path: benchmark.json
-EOF
+      - name: Install survivex + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[all]"
+
+      - name: Run test suite (R-backed tests auto-skip without R)
+        run: |
+          pytest tests/ -v -p no:cacheprovider
