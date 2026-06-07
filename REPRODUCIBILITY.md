@@ -70,8 +70,8 @@ Or run each group on its own:
 
 | Group | Reference | Command | Target |
 |---|---|---|---|
-| Cox PH (Breslow/Efron, stratified, Ridge) | R `survival` + `penalized` | `.venv/bin/python tests/validate_coxph_vs_R.py` | ~1e-15 (Ridge ~1e-6) |
-| Gamma frailty | R `frailtyEM` (EM) | `.venv/bin/python tests/validate_frailty_vs_R.py` | ~1e-4 vs EM |
+| Cox PH (Breslow/Efron, stratified, Ridge) | R `survival` + `penalized` | `.venv/bin/python tests/validate_coxph_vs_R.py` | ~1e-15 |
+| Gamma frailty | R `frailtyEM` (EM) | `.venv/bin/python tests/validate_frailty_vs_R.py` | ~1e-4 (rats) to ~3.6e-3 (kidney) vs EM |
 | Recurrent events (AG, PWP-TT, PWP-GT) | R `survival` (references baked into the test) | `.venv/bin/python tests/test_recurrent.py` | machine ε |
 | KM / NA / parametric / competing risks / trees / GBM | lifelines | per-model `tests/test_*.py` | ~1e-8 |
 
@@ -96,25 +96,21 @@ Notes:
 
 ## Table 3 — CPU benchmark
 
-Median of 5 runs on an **Apple M2 Pro (16 GB)**, survivex vs lifelines on
-synthetic data. The CPU rows are the `survivex-cpu` and `lifelines-cpu`
-backends of the same seeded harness used for Table 4:
+Median of 21 runs on an **Apple M2 Pro (16 GB)**, survivex vs lifelines on the
+small standard datasets (gbsg2, rossi). Fully scripted in
+`benchmarks/cpu_standard/`:
 
 ```bash
-cd benchmarks/synthetic
-python run_benchmark.py --families coxph \
-    --backends survivex-cpu lifelines-cpu \
-    --seeds 42 --n-runs 5
+cd benchmarks/cpu_standard
+python run_cpu_benchmark.py            # writes results/cpu_standard_timings.csv
 ```
 
-The four synthetic-data generators (`generate_large_synthetic`,
-`generate_recurrent_data`, `generate_competing_risks_data`,
-`generate_clustered_data`) live in `benchmarks/synthetic/generators.py`, ported
-verbatim from the original `benchmark_gpu_scaling.ipynb` (the version of record
-for the submitted numbers) and all default to `seed=42`. The runner writes
-`results/synthetic_scaling_timings.csv` (median wall-clock, peak CPU/GPU memory,
-c-index, CPU-vs-GPU coefficient agreement) and prints a summary table. See
-`benchmarks/synthetic/README.md` for the full family/grid table.
+The script loads gbsg2 (Kaplan-Meier, Nelson-Aalen, Cox PH) and rossi
+(Weibull / Log-Normal / Log-Logistic AFT) from lifelines, times each model
+against its lifelines counterpart as the median over `--n-runs` repetitions
+(default 21) after one warm-up call, and reports the lifelines/survivex
+speedup. See `benchmarks/cpu_standard/README.md` for details. Timings are
+hardware-dependent; the table figures are from the Apple M2 Pro above.
 
 ---
 
@@ -182,7 +178,7 @@ provenance.
   and solver settings (Newton-Raphson / EM, no stochastic steps).
 - GBM and tree models use seeded RNG; pass the documented `seed=42`.
 - Benchmark *timings* vary run-to-run; the reported figures are medians
-  (Table 3: 5 runs; Table 4: 3 runs).
+  (Table 3: 21 runs; Table 4: 3 runs).
 - At `p > n_events`, unpenalized Cox coefficients are non-identifiable (the
   Hessian is near-singular) and differ across hardware along the null space
   even though the c-index and predictions agree; use `--penalty` to regularize.
