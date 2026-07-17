@@ -10,6 +10,7 @@ point for reviewers and users who want to re-run the validation and benchmarks.
 | Table 2 | Validation accuracy vs reference implementations | [Validation suite](#table-2--validation-accuracy) | CPU (any) |
 | Table 3 | CPU performance vs lifelines | [CPU benchmark](#table-3--cpu-benchmark) | Apple M2 Pro, 16 GB |
 | Table 4 | GPU scaling + real-data benchmark | [GPU benchmark](#table-4--gpu-benchmark) | NVIDIA RTX A6000, 48 GB |
+| Ablation | Analytic vs. autodiff derivatives | [Ablation](#analytic-vs-autodiff-ablation) | CPU + NVIDIA RTX A6000 |
 
 All randomized procedures use fixed seeds (documented per section). Numerical
 agreement targets are stated alongside each command.
@@ -48,6 +49,35 @@ install.packages(c("survival", "penalized", "frailtyEM", "coxme"))
 - `penalized` — Cox Ridge (L2) gold standard
 - `frailtyEM` — gamma shared-frailty EM (same estimator as survivex)
 - `coxme` — log-normal frailty marginal likelihood (cross-check)
+
+### Pinned package versions (validation reference)
+
+The Table 2 validation figures were produced with the versions below. All
+validation runs use **double precision (float64)** on CPU and CUDA (MPS is
+float32-only and is not used for the reported tables); solver tolerances are
+pinned tight on both sides (survivex `tol=1e-12`, up to 200 iterations; R
+`coxph.control(eps=1e-12)`); and all randomized procedures use **seed 42**. The
+CI matrix below installs current releases, which reproduce the same agreement.
+
+| Component | Version | Component | Version |
+|---|---|---|---|
+| Python | 3.12 | lifelines | 0.30.3 |
+| PyTorch | 2.12.0 | R `survival` | 3.8.3 |
+| NumPy | 2.4.6 | R `penalized` | 0.9.53 |
+| SciPy | 1.17.1 | R `frailtyEM` | 1.0.1 |
+| pandas | 2.3.3 | R `coxme` | 2.2.22 |
+| numba | 0.65.1 | scikit-learn | 1.8.0 |
+
+### Continuous integration
+
+Two GitHub Actions workflows in `.github/workflows/`:
+
+- `ci.yml` — fast tier, on every push: **ubuntu-latest × Python 3.10 / 3.11 /
+  3.12**, `pip install -e ".[all]"`, then `pytest tests/`. R-backed tests
+  auto-skip when `Rscript` is absent.
+- `validation.yml` — nightly tier (cron) + manual dispatch: installs R
+  (`survival`, `penalized`, `frailtyEM`, `coxme`) and runs the full R
+  gold-standard validators plus the test suite.
 
 ---
 
@@ -169,6 +199,29 @@ columns: backend, p, seed, fit time, peak GPU memory, c-index, coefficient
 agreement. cBioPortal data is mutable — the gene universe can shift between
 downloads — so cite the download date; `download.py` logs per-file SHA-256 for
 provenance.
+
+---
+
+## Analytic-vs-autodiff ablation
+
+Quantifies the speed contributed by survivex's closed-form Cox gradient and
+Hessian versus automatic differentiation (paper Section 2.3.3). Fully scripted
+in `benchmarks/ablation_autodiff/`:
+
+```bash
+cd benchmarks/ablation_autodiff
+python run_ablation.py --p 20 100 500 1000 --n 2000 --seed 42 \
+    --device cpu  --output results/ablation_cpu.csv
+CUDA_VISIBLE_DEVICES=0 python run_ablation.py --p 20 100 500 1000 --n 2000 \
+    --seed 42 --device cuda --output results/ablation_cuda.csv
+```
+
+The same Breslow partial likelihood is fit with a Newton-Raphson loop using
+either closed-form or autograd-computed derivatives, plus a gradient-only
+L-BFGS variant. The script validates the analytic gradient and Hessian against
+autograd before timing (so the comparison is on the same objective), and both
+Newton paths converge in the same number of iterations. See
+`benchmarks/ablation_autodiff/README.md` for details.
 
 ---
 
