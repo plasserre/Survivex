@@ -133,6 +133,11 @@ cgd_data.csv
 *.rds
 .Rhistory
 *.R
+# keep the R reference/validation scripts (needed by the nightly R gold-standard CI)
+!tests/validate_coxph_R.R
+!tests/validate_frailty_R.R
+!tests/validate_recurrent_R.R
+!tests/benchmark_recurrent_R.R
 
 
 # Benchmark and validation files (keep locally, don't track)
